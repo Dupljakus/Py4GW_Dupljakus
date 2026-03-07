@@ -11,6 +11,10 @@ def test_classify_map_instance_transition_detects_instance_rollback():
     assert classify_map_instance_transition(1, 5000, 1, 100) == "instance_change"
 
 
+def test_classify_map_instance_transition_ignores_stale_same_map_high_uptime_sample():
+    assert classify_map_instance_transition(93, 32000, 93, 29749) == ""
+
+
 def test_classify_map_instance_transition_ignores_normal_uptime_growth():
     assert classify_map_instance_transition(1, 5000, 1, 5200) == ""
 

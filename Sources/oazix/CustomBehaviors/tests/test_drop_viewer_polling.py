@@ -1165,6 +1165,58 @@ def test_update_resets_existing_rows_on_instance_change(monkeypatch):
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_update_ignores_stale_same_map_high_uptime_rollback(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    viewer.last_update_time = 0.0
+    viewer.last_seen_map_id = 93
+    viewer.last_seen_instance_uptime_ms = 32000
+    viewer.raw_drops = [[
+        "2026-02-28 14:42:37",
+        "Leader",
+        "93",
+        "Spearhead Peak",
+        "Leader",
+        "Icy Lodestone",
+        "1",
+        "White",
+        "ev-old",
+        "",
+        "42",
+        "self@test",
+    ]]
+    viewer.total_drops = 1
+    fake_sender = SimpleNamespace(
+        resets=0,
+        last_seen_map_id=0,
+        last_seen_instance_uptime_ms=0,
+    )
+
+    def _reset_tracking_state():
+        fake_sender.resets += 1
+
+    fake_sender._reset_tracking_state = _reset_tracking_state
+    monkeypatch.setattr(module, "DropTrackerSender", lambda: fake_sender)
+
+    py4gw_mod.GLOBAL_CACHE.ShMem = _FakeShMem([])
+    monkeypatch.setattr(module.Map, "GetMapID", lambda: 93)
+    monkeypatch.setattr(module.Map, "GetInstanceUptime", lambda: 29749, raising=False)
+    monkeypatch.setattr(module.Player, "IsChatHistoryReady", lambda: True)
+    monkeypatch.setattr(module.Player, "GetChatHistory", lambda: [])
+
+    try:
+        viewer.update()
+        assert viewer.last_seen_map_id == 93
+        assert viewer.last_seen_instance_uptime_ms == 29749
+        assert viewer.raw_drops != []
+        assert viewer.total_drops == 1
+        assert viewer.status_message != "Auto reset on map change"
+        assert fake_sender.resets == 0
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_update_rejects_stale_follower_drop_session_after_reset(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
@@ -1324,6 +1376,32 @@ def test_sender_buffer_pending_slot_delta_preserves_reused_slot_as_orphan(monkey
             "first_seen": 10.0,
             "last_seen": 20.0,
         }
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_sender_ignores_stale_same_map_high_uptime_rollback(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender_module = sys.modules[module.DropTrackerSender.__module__]
+    sender = module.DropTrackerSender()
+    sender.last_seen_map_id = 93
+    sender.last_seen_instance_uptime_ms = 32000
+    sender.last_inventory_snapshot = {(1, 1): ("Icy Lodestone", "White", 1, 500, 42)}
+    sender.pending_slot_deltas = {(1, 1): {"qty": 1, "item_id": 42, "model_id": 500}}
+    sender.is_warmed_up = True
+
+    monkeypatch.setattr(sender_module.Map, "GetMapID", lambda: 93)
+    monkeypatch.setattr(sender_module.Map, "GetInstanceUptime", lambda: 29749, raising=False)
+    monkeypatch.setattr(sender_module, "read_current_map_instance", lambda: (93, 29749))
+
+    try:
+        sender.act()
+        assert sender.last_seen_map_id == 93
+        assert sender.last_seen_instance_uptime_ms == 29749
+        assert sender.last_inventory_snapshot == {(1, 1): ("Icy Lodestone", "White", 1, 500, 42)}
+        assert sender.pending_slot_deltas == {(1, 1): {"qty": 1, "item_id": 42, "model_id": 500}}
+        assert sender.is_warmed_up is True
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

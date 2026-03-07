@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 INSTANCE_UPTIME_ROLLBACK_GRACE_MS = 2000
+INSTANCE_CHANGE_FRESH_UPTIME_MAX_MS = 5000
 
 
 def read_current_map_instance() -> tuple[int, int]:
@@ -34,7 +35,12 @@ def classify_map_instance_transition(
         return ""
     if map_id != prev_map_id:
         return "map_change"
-    if prev_uptime_ms > 0 and uptime_ms > 0 and (uptime_ms + rollback_grace_ms) < prev_uptime_ms:
+    if (
+        prev_uptime_ms > 0
+        and uptime_ms > 0
+        and uptime_ms <= INSTANCE_CHANGE_FRESH_UPTIME_MAX_MS
+        and (uptime_ms + rollback_grace_ms) < prev_uptime_ms
+    ):
         return "instance_change"
     return ""
 
