@@ -1044,6 +1044,12 @@ def test_poll_shared_memory_exact_event_name_update_does_not_rename_same_sender_
 def test_update_resets_existing_rows_on_map_change(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    log_store_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_log_store"
+    )
+    model_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_models"
+    )
     viewer = module.DropViewerWindow()
     viewer.last_update_time = 0.0
     viewer.last_seen_map_id = 1
@@ -1063,6 +1069,9 @@ def test_update_resets_existing_rows_on_map_change(monkeypatch):
         "self@test",
     ]]
     viewer.total_drops = 1
+    original_row = model_module.DropLogRow.from_runtime_row(viewer.raw_drops[0])
+    assert original_row is not None
+    log_store_module.append_drop_log_rows(viewer.log_path, [original_row])
 
     py4gw_mod.GLOBAL_CACHE.ShMem = _FakeShMem([
         (
@@ -1089,6 +1098,7 @@ def test_update_resets_existing_rows_on_map_change(monkeypatch):
         assert viewer.map_change_ignore_until > 0.0
         assert viewer.status_message == "Auto reset on map change"
         assert py4gw_mod.GLOBAL_CACHE.ShMem.finished == [0]
+        assert len(log_store_module.parse_drop_log_file(viewer.log_path)) == 1
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -1096,6 +1106,12 @@ def test_update_resets_existing_rows_on_map_change(monkeypatch):
 def test_update_resets_existing_rows_on_instance_change(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    log_store_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_log_store"
+    )
+    model_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_models"
+    )
     viewer = module.DropViewerWindow()
     viewer.last_update_time = 0.0
     viewer.last_seen_map_id = 1
@@ -1115,6 +1131,9 @@ def test_update_resets_existing_rows_on_instance_change(monkeypatch):
         "self@test",
     ]]
     viewer.total_drops = 1
+    original_row = model_module.DropLogRow.from_runtime_row(viewer.raw_drops[0])
+    assert original_row is not None
+    log_store_module.append_drop_log_rows(viewer.log_path, [original_row])
     fake_sender = SimpleNamespace(
         resets=0,
         last_seen_map_id=0,
@@ -1141,6 +1160,7 @@ def test_update_resets_existing_rows_on_instance_change(monkeypatch):
         assert fake_sender.resets == 1
         assert fake_sender.last_seen_map_id == 1
         assert fake_sender.last_seen_instance_uptime_ms == 100
+        assert len(log_store_module.parse_drop_log_file(viewer.log_path)) == 1
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -2264,6 +2284,49 @@ def test_viewer_row_name_update_logs_debug_event(monkeypatch):
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_viewer_row_name_update_syncs_selected_and_hover_item_keys(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    row_updates_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_row_updates"
+    )
+    viewer = module.DropViewerWindow()
+    target_row = [
+        "2026-03-07 03:13:41",
+        "Dupljakus D",
+        "93",
+        "Spearhead Peak",
+        "Mesmer Tri",
+        "Frigid Heart",
+        "1",
+        "Gold",
+        "ev-frigid",
+        "Unidentified",
+        "753",
+        "damirgw4@gmail.com",
+    ]
+    viewer.raw_drops = [target_row]
+    viewer.selected_item_key = ("Some Other Name", "Gold")
+    viewer.selected_log_row = target_row
+    viewer.hover_preview_item_key = ("Hover Old Name", "Gold")
+    viewer.hover_preview_log_row = target_row
+
+    try:
+        renamed = row_updates_module.update_rows_item_name_by_event_and_sender(
+            viewer,
+            "ev-frigid",
+            "damirgw4@gmail.com",
+            "Frigid Heart of Endurance",
+            player_name="Mesmer Tri",
+            only_if_unknown=False,
+        )
+        assert renamed == 1
+        assert viewer.selected_item_key == ("Frigid Heart of Endurance", "Gold")
+        assert viewer.hover_preview_item_key == ("Frigid Heart of Endurance", "Gold")
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_signature_and_sender_name_update_skips_ambiguous_multi_event_signature(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
@@ -2790,6 +2853,65 @@ def test_stats_mismatch_log_ignores_joined_preposition_spacing_variant(monkeypat
             first_line_name="",
             rendered_head="",
             update_source="payload",
+        )
+        assert emitted == []
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_selected_stats_name_mismatch_log_emits_when_row_name_and_stats_diverge(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    panels_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_draw_panels"
+    )
+    viewer = module.DropViewerWindow()
+    emitted: list[dict[str, object]] = []
+    viewer._append_live_debug_log = lambda event, message, **fields: emitted.append(
+        {"event": event, "message": message, **fields}
+    )
+    try:
+        panels_module._append_selected_stats_name_mismatch_debug_log(
+            viewer,
+            event_id="ev-ui-mismatch",
+            sender_email="sender@test",
+            player_name="Player One",
+            selected_item_name="Spearhead Peak Prize",
+            row_item_name="Spearhead Peak Prize",
+            stats_text="Frigid Heart of Endurance\nArmor: 16 (vs 8)",
+        )
+        assert len(emitted) == 1
+        assert emitted[0]["event"] == "viewer_selected_stats_name_mismatch"
+        assert emitted[0]["row_item_name"] == "Spearhead Peak Prize"
+        assert emitted[0]["stats_first_line"] == "Frigid Heart of Endurance"
+        assert viewer.selected_name_mismatch_popup_pending is True
+        assert "Selected: Spearhead Peak Prize" in viewer.selected_name_mismatch_popup_message
+        assert "Stats: Frigid Heart of Endurance" in viewer.selected_name_mismatch_popup_message
+        assert float(viewer.selected_name_mismatch_popup_until) > 0.0
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_selected_stats_name_mismatch_log_ignores_matching_row_name(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    panels_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_draw_panels"
+    )
+    viewer = module.DropViewerWindow()
+    emitted: list[dict[str, object]] = []
+    viewer._append_live_debug_log = lambda event, message, **fields: emitted.append(
+        {"event": event, "message": message, **fields}
+    )
+    try:
+        panels_module._append_selected_stats_name_mismatch_debug_log(
+            viewer,
+            event_id="ev-ui-match",
+            sender_email="sender@test",
+            player_name="Player One",
+            selected_item_name="Frigid Heart of Endurance",
+            row_item_name="Frigid Heart of Endurance",
+            stats_text="Frigid Heart of Endurance\nArmor: 16 (vs 8)",
         )
         assert emitted == []
     finally:
@@ -5575,6 +5697,12 @@ def test_pending_identify_mod_capture_rearms_sender_name_refresh(monkeypatch):
 def test_reset_live_session_clears_tracker_linkage_state(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    log_store_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_log_store"
+    )
+    model_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_models"
+    )
     viewer = module.DropViewerWindow()
     viewer.raw_drops = [["ts", "bot", "1", "Map", "Leader", "Icy Lodestone", "1", "White", "ev-1", "stats", "42", "self@test"]]
     viewer.aggregated_drops = {("Icy Lodestone", "White"): {"Quantity": 1, "Count": 1}}
@@ -5593,6 +5721,9 @@ def test_reset_live_session_clears_tracker_linkage_state(monkeypatch):
     viewer.remote_stats_pending_by_event = {"email:self@test:ev-1": 11.0}
     viewer.model_name_by_id = {500: "Icy Lodestone"}
     viewer._shmem_scan_start_index = 17
+    original_row = model_module.DropLogRow.from_runtime_row(viewer.raw_drops[0])
+    assert original_row is not None
+    log_store_module.append_drop_log_rows(viewer.log_path, [original_row])
 
     try:
         viewer._reset_live_session()
@@ -5613,6 +5744,48 @@ def test_reset_live_session_clears_tracker_linkage_state(monkeypatch):
         assert viewer.remote_stats_pending_by_event == {}
         assert viewer.model_name_by_id == {}
         assert viewer._shmem_scan_start_index == 0
+        assert log_store_module.parse_drop_log_file(viewer.log_path) == []
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_reset_live_session_can_preserve_live_log_file(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    log_store_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_log_store"
+    )
+    model_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_models"
+    )
+    viewer = module.DropViewerWindow()
+    viewer.raw_drops = [[
+        "2026-03-06 02:48:25",
+        "Viewer",
+        "92",
+        "Tasca's Demise",
+        "Player Two",
+        "Earth Staff",
+        "1",
+        "Purple",
+        "ev-preserve",
+        "Unidentified",
+        "431",
+        "sender@test",
+    ]]
+    viewer.total_drops = 1
+    original_row = model_module.DropLogRow.from_runtime_row(viewer.raw_drops[0])
+    assert original_row is not None
+    log_store_module.append_drop_log_rows(viewer.log_path, [original_row])
+
+    try:
+        viewer._reset_live_session(preserve_live_log=True)
+        parsed = log_store_module.parse_drop_log_file(viewer.log_path)
+        assert len(parsed) == 1
+        assert parsed[0].event_id == "ev-preserve"
+        assert viewer.raw_drops == []
+        assert viewer.total_drops == 0
+        assert viewer.last_read_time == os.path.getmtime(viewer.log_path)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

@@ -36,6 +36,88 @@ def _current_drop_tracker_sender(viewer):
         return None
 
 
+def _compact_item_name_key(viewer, value: str) -> str:
+    clean_value = viewer._clean_item_name(value).strip().lower()
+    if not clean_value:
+        return ""
+    return "".join(ch for ch in clean_value if ch.isalnum())
+
+
+def _append_selected_stats_name_mismatch_debug_log(
+    viewer,
+    *,
+    event_id: str,
+    sender_email: str,
+    player_name: str,
+    selected_item_name: str,
+    row_item_name: str,
+    stats_text: str,
+) -> None:
+    append_fn = getattr(viewer, "_append_live_debug_log", None)
+    if not callable(append_fn):
+        return
+    clean_row_name = viewer._clean_item_name(row_item_name).strip()
+    clean_selected_name = viewer._clean_item_name(selected_item_name).strip()
+    if not clean_row_name:
+        return
+    first_line = ""
+    for raw_line in viewer._ensure_text(stats_text).splitlines():
+        line_txt = viewer._clean_item_name(raw_line).strip()
+        if not line_txt:
+            continue
+        if line_txt.lower() == "unidentified":
+            return
+        first_line = line_txt
+        break
+    if not first_line:
+        return
+
+    normalized_names = {
+        viewer._normalize_item_name(clean_row_name),
+        viewer._normalize_item_name(clean_selected_name),
+    }
+    normalized_names.discard("")
+    normalized_first_line = viewer._normalize_item_name(first_line)
+    if normalized_first_line in normalized_names:
+        return
+
+    compact_first_line = _compact_item_name_key(viewer, first_line)
+    compact_names = {_compact_item_name_key(viewer, clean_row_name), _compact_item_name_key(viewer, clean_selected_name)}
+    compact_names.discard("")
+    if compact_first_line and any(
+        compact_first_line == candidate or compact_first_line in candidate or candidate in compact_first_line
+        for candidate in compact_names
+    ):
+        return
+
+    event_key = viewer._ensure_text(event_id).strip()
+    sender_key = viewer._ensure_text(sender_email).strip().lower()
+    append_fn(
+        "viewer_selected_stats_name_mismatch",
+        f"event_id={event_key or '-'}",
+        event_id=event_key,
+        sender_email=sender_key,
+        player_name=viewer._ensure_text(player_name).strip(),
+        selected_item_name=clean_selected_name,
+        row_item_name=clean_row_name,
+        stats_first_line=first_line,
+        dedupe_key=(
+            f"viewer_selected_stats_name_mismatch:{event_key}:{sender_key}:"
+            f"{clean_selected_name.lower()}:{clean_row_name.lower()}:{first_line.lower()}"
+        ),
+        dedupe_interval_s=1.5,
+    )
+    viewer.selected_name_mismatch_popup_message = (
+        f"Selected item mismatch\n"
+        f"Player: {viewer._ensure_text(player_name).strip() or 'Unknown'}\n"
+        f"Selected: {clean_selected_name or '-'}\n"
+        f"Row: {clean_row_name or '-'}\n"
+        f"Stats: {first_line or '-'}"
+    )
+    viewer.selected_name_mismatch_popup_until = time.time() + 5.0
+    viewer.selected_name_mismatch_popup_pending = True
+
+
 def draw_selected_item_details(viewer):
     pyimgui = _runtime_attr(viewer, "PyImGui")
     imgui = _runtime_attr(viewer, "ImGui")
@@ -101,6 +183,15 @@ def draw_selected_item_details(viewer):
         pyimgui.text_colored(f"Selected Entry: {selected_char} | {selected_map} | {selected_ts}", rarity_color)
         pyimgui.text_colored(f"Selected Qty: {selected_qty}", rarity_color)
         stats_text = viewer._get_row_stats_text(active_log_row)
+        _append_selected_stats_name_mismatch_debug_log(
+            viewer,
+            event_id=viewer._extract_row_event_id(active_log_row),
+            sender_email=viewer._extract_row_sender_email(active_log_row),
+            player_name=viewer._ensure_text(selected_parsed.player_name if selected_parsed else "").strip(),
+            selected_item_name=viewer._ensure_text(stats.get("name", "")).strip(),
+            row_item_name=viewer._ensure_text(selected_parsed.item_name if selected_parsed else "").strip(),
+            stats_text=stats_text,
+        )
         if stats_text:
             pyimgui.separator()
             pyimgui.text_colored("Item Mods / Stats", rarity_color)

@@ -805,6 +805,9 @@ class DropViewerWindow:
         self.unknown_mod_popup_enabled = True
         self.unknown_mod_popup_pending = False
         self.unknown_mod_popup_message = ""
+        self.selected_name_mismatch_popup_pending = False
+        self.selected_name_mismatch_popup_message = ""
+        self.selected_name_mismatch_popup_until = 0.0
         self.unknown_mod_custom_names: dict[str, str] = {}
         self.unknown_mod_name_edit_id = 0
         self.unknown_mod_name_edit_text = ""
@@ -1378,12 +1381,12 @@ class DropViewerWindow:
         return normalize_rarity_label(self, item_name, rarity)
 
 
-    def _reset_live_log_file(self):
-        return reset_live_log_file(self)
+    def _reset_live_log_file(self, *args, **kwargs):
+        return reset_live_log_file(self, *args, **kwargs)
 
 
-    def _reset_live_session(self):
-        return reset_live_session(self)
+    def _reset_live_session(self, *args, **kwargs):
+        return reset_live_session(self, *args, **kwargs)
 
 
     def _arm_reset_trace(

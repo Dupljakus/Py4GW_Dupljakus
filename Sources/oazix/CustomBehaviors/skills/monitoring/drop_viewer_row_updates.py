@@ -105,6 +105,28 @@ def _append_name_update_debug_log(
     )
 
 
+def _sync_selection_keys_for_renamed_row(
+    viewer,
+    *,
+    row: Any,
+    rarity: Any,
+    item_name: Any,
+) -> None:
+    if not isinstance(row, list):
+        return
+    clean_name = viewer._clean_item_name(item_name).strip()
+    rarity_text = viewer._ensure_text(rarity).strip() or "Unknown"
+    if not clean_name:
+        return
+    next_item_key = (clean_name, rarity_text)
+
+    if getattr(viewer, "selected_log_row", None) is row:
+        viewer.selected_item_key = next_item_key
+
+    if getattr(viewer, "hover_preview_log_row", None) is row:
+        viewer.hover_preview_item_key = next_item_key
+
+
 def should_allow_late_name_update(viewer, rarity: Any, current_name: Any, proposed_name: Any = "") -> bool:
     rarity_txt = viewer._ensure_text(rarity).strip().lower()
     current_txt = viewer._clean_item_name(current_name).strip().lower()
@@ -168,6 +190,12 @@ def update_rows_item_name_by_event_and_sender(
         if current_name == clean_name:
             continue
         set_row_item_name(viewer, row, clean_name)
+        _sync_selection_keys_for_renamed_row(
+            viewer,
+            row=row,
+            rarity=parsed.rarity,
+            item_name=clean_name,
+        )
         _append_name_update_debug_log(
             viewer,
             event_id=event_key,
@@ -247,6 +275,12 @@ def update_rows_item_name_by_signature_and_sender(
     if current_name == clean_name:
         return 0
     set_row_item_name(viewer, row, clean_name)
+    _sync_selection_keys_for_renamed_row(
+        viewer,
+        row=row,
+        rarity=parsed.rarity,
+        item_name=clean_name,
+    )
     _append_name_update_debug_log(
         viewer,
         event_id=event_id,

@@ -293,6 +293,10 @@ def _debug_sender_email(row: dict[str, Any]) -> str:
     return _clean_sender_email(row.get("sender_email", ""))
 
 
+def _debug_receiver_email(row: dict[str, Any]) -> str:
+    return _clean_sender_email(row.get("receiver_email", ""))
+
+
 def _is_stats_exempt_rarity(rarity_value: Any) -> bool:
     rarity = str(rarity_value or "").strip().lower()
     return rarity in {"material", "dyes", "keys", "gold"}
@@ -319,6 +323,13 @@ def _build_event_lifecycle(
             lifecycle[event_id] = {
                 "event_id": event_id,
                 "sender_email": "",
+                "receiver_email": "",
+                "receiver_in_party": None,
+                "role": "",
+                "item_name": "",
+                "label": event_id,
+                "target_resolved": False,
+                "invalid_target": False,
                 "accepted": False,
                 "sent": False,
                 "acked": False,
@@ -345,8 +356,25 @@ def _build_event_lifecycle(
         sender_email = _debug_sender_email(row)
         if sender_email and not entry["sender_email"]:
             entry["sender_email"] = sender_email
+        receiver_email = _debug_receiver_email(row)
+        if receiver_email and not entry["receiver_email"]:
+            entry["receiver_email"] = receiver_email
+        role = str(row.get("role", "") or "").strip()
+        if role and not entry["role"]:
+            entry["role"] = role
+        item_name = str(row.get("item_name", "") or "").strip()
+        if item_name and not entry["item_name"]:
+            entry["item_name"] = item_name
+            entry["label"] = item_name
         if event_name == "viewer_drop_accepted":
             entry["accepted"] = True
+        elif event_name == "tracker_transport_target_resolved":
+            entry["target_resolved"] = True
+            in_party_flag = row.get("receiver_in_party", None)
+            if isinstance(in_party_flag, bool):
+                entry["receiver_in_party"] = in_party_flag
+                if not in_party_flag:
+                    entry["invalid_target"] = True
         elif event_name == "tracker_drop_sent":
             entry["sent"] = True
         elif event_name == "tracker_drop_acked":
@@ -373,10 +401,18 @@ def _build_event_lifecycle(
             entry["sender_email"] = sender_email
         entry["csv_rarity"] = str(row.get("Rarity", "") or "Unknown").strip() or "Unknown"
         entry["csv_label"] = _row_item_label(row)
+        csv_item_name = str(row.get("ItemName", "") or "").strip()
+        if csv_item_name and not entry["item_name"]:
+            entry["item_name"] = csv_item_name
+        entry["label"] = entry["csv_label"] or entry["item_name"] or event_id
 
     lifecycle_rows = sorted(
         lifecycle.values(),
-        key=lambda row: (str(row.get("sender_email", "") or ""), str(row.get("event_id", "") or "")),
+        key=lambda row: (
+            str(row.get("sender_email", "") or ""),
+            str(row.get("receiver_email", "") or ""),
+            str(row.get("event_id", "") or ""),
+        ),
     )
 
     lifecycle_gaps: list[dict[str, Any]] = []
@@ -386,27 +422,50 @@ def _build_event_lifecycle(
         if not event_id:
             continue
         sender_email = str(row.get("sender_email", "") or "").strip().lower()
-        csv_label = str(row.get("csv_label", "") or "").strip() or event_id
+        receiver_email = str(row.get("receiver_email", "") or "").strip().lower()
+        label = (
+            str(row.get("csv_label", "") or "").strip()
+            or str(row.get("item_name", "") or "").strip()
+            or event_id
+        )
+        gap_codes: list[str] = []
+        owner_hints: list[str] = []
+
+        def _append_gap(code: str, severity: str, owner_hint: str) -> None:
+            lifecycle_gaps.append(
+                {
+                    "severity": severity,
+                    "code": code,
+                    "owner_hint": owner_hint,
+                    "event_id": event_id,
+                    "sender_email": sender_email,
+                    "receiver_email": receiver_email,
+                    "label": label,
+                }
+            )
+            if code not in gap_codes:
+                gap_codes.append(code)
+                owner_hints.append(owner_hint)
+
+        if bool(row.get("invalid_target", False)):
+            _append_gap("invalid_target", "critical", "sender")
+        if bool(row.get("send_failed", False)):
+            _append_gap("send_failed", "critical", "sender")
+        if (
+            bool(row.get("target_resolved", False))
+            and not bool(row.get("sent", False))
+            and not bool(row.get("send_failed", False))
+            and not bool(row.get("accepted", False))
+        ):
+            _append_gap("resolved_missing_send", "major", "sender")
+        if bool(row.get("sent", False)) and not bool(row.get("accepted", False)):
+            _append_gap("sent_missing_accepted", "critical", "receiver")
+        if bool(row.get("accepted", False)) and not bool(row.get("acked", False)):
+            _append_gap("accepted_missing_ack", "major", "receiver_ack")
         if bool(row.get("accepted", False)) and not bool(row.get("csv", False)):
-            lifecycle_gaps.append(
-                {
-                    "severity": "critical",
-                    "code": "accepted_missing_csv",
-                    "event_id": event_id,
-                    "sender_email": sender_email,
-                    "label": csv_label,
-                }
-            )
+            _append_gap("accepted_missing_csv", "critical", "viewer_csv")
         if bool(row.get("csv", False)) and not bool(row.get("accepted", False)):
-            lifecycle_gaps.append(
-                {
-                    "severity": "critical",
-                    "code": "csv_missing_accepted",
-                    "event_id": event_id,
-                    "sender_email": sender_email,
-                    "label": csv_label,
-                }
-            )
+            _append_gap("csv_missing_accepted", "critical", "receiver")
         if (
             bool(row.get("accepted", False))
             and bool(row.get("csv", False))
@@ -418,19 +477,18 @@ def _build_event_lifecycle(
                 {
                     "event_id": event_id,
                     "sender_email": sender_email,
-                    "label": csv_label,
+                    "receiver_email": receiver_email,
+                    "label": label,
                     "rarity": str(row.get("csv_rarity", "") or "Unknown").strip() or "Unknown",
                 }
             )
-            lifecycle_gaps.append(
-                {
-                    "severity": "major",
-                    "code": "accepted_missing_stats_binding",
-                    "event_id": event_id,
-                    "sender_email": sender_email,
-                    "label": csv_label,
-                }
-            )
+            _append_gap("accepted_missing_stats_binding", "major", "viewer_stats")
+        row["gap_codes"] = gap_codes
+        row["owner_hints"] = owner_hints
+        row["primary_gap_code"] = gap_codes[0] if gap_codes else ""
+        row["primary_owner_hint"] = owner_hints[0] if owner_hints else ""
+        row["label"] = label
+        row["problem_event"] = bool(gap_codes)
     return lifecycle_rows, lifecycle_gaps, accepted_missing_stats_binding
 
 
@@ -452,6 +510,7 @@ def _build_sender_lifecycle_summary(lifecycle_rows: list[dict[str, Any]]) -> lis
                 "accepted_missing_csv": 0,
                 "csv_missing_accepted": 0,
                 "accepted_missing_stats_binding": 0,
+                "problem_events": 0,
             }
             by_sender[sender_email] = sender_entry
         sender_entry["events"] = int(sender_entry.get("events", 0)) + 1
@@ -467,6 +526,8 @@ def _build_sender_lifecycle_summary(lifecycle_rows: list[dict[str, Any]]) -> lis
             sender_entry["stats_bound"] = int(sender_entry.get("stats_bound", 0)) + 1
         if bool(row.get("send_failed", False)):
             sender_entry["send_failed"] = int(sender_entry.get("send_failed", 0)) + 1
+        if bool(row.get("problem_event", False)):
+            sender_entry["problem_events"] = int(sender_entry.get("problem_events", 0)) + 1
         if bool(row.get("accepted", False)) and (not bool(row.get("csv", False))):
             sender_entry["accepted_missing_csv"] = int(sender_entry.get("accepted_missing_csv", 0)) + 1
         if bool(row.get("csv", False)) and (not bool(row.get("accepted", False))):
@@ -493,6 +554,108 @@ def _build_sender_lifecycle_summary(lifecycle_rows: list[dict[str, Any]]) -> lis
     )
 
 
+def _build_receiver_lifecycle_summary(lifecycle_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_receiver: dict[str, dict[str, Any]] = {}
+    for row in list(lifecycle_rows or []):
+        receiver_email = str(row.get("receiver_email", "") or "").strip().lower() or "unknown"
+        receiver_entry = by_receiver.get(receiver_email)
+        if receiver_entry is None:
+            receiver_entry = {
+                "receiver_email": receiver_email,
+                "events": 0,
+                "target_resolved": 0,
+                "accepted": 0,
+                "acked": 0,
+                "csv": 0,
+                "invalid_target": 0,
+                "sent_missing_accepted": 0,
+                "accepted_missing_ack": 0,
+                "accepted_missing_csv": 0,
+                "problem_events": 0,
+            }
+            by_receiver[receiver_email] = receiver_entry
+        receiver_entry["events"] = int(receiver_entry.get("events", 0)) + 1
+        if bool(row.get("target_resolved", False)):
+            receiver_entry["target_resolved"] = int(receiver_entry.get("target_resolved", 0)) + 1
+        if bool(row.get("accepted", False)):
+            receiver_entry["accepted"] = int(receiver_entry.get("accepted", 0)) + 1
+        if bool(row.get("acked", False)):
+            receiver_entry["acked"] = int(receiver_entry.get("acked", 0)) + 1
+        if bool(row.get("csv", False)):
+            receiver_entry["csv"] = int(receiver_entry.get("csv", 0)) + 1
+        if bool(row.get("invalid_target", False)):
+            receiver_entry["invalid_target"] = int(receiver_entry.get("invalid_target", 0)) + 1
+        if bool(row.get("sent", False)) and (not bool(row.get("accepted", False))):
+            receiver_entry["sent_missing_accepted"] = int(receiver_entry.get("sent_missing_accepted", 0)) + 1
+        if bool(row.get("accepted", False)) and (not bool(row.get("acked", False))):
+            receiver_entry["accepted_missing_ack"] = int(receiver_entry.get("accepted_missing_ack", 0)) + 1
+        if bool(row.get("accepted", False)) and (not bool(row.get("csv", False))):
+            receiver_entry["accepted_missing_csv"] = int(receiver_entry.get("accepted_missing_csv", 0)) + 1
+        if bool(row.get("problem_event", False)):
+            receiver_entry["problem_events"] = int(receiver_entry.get("problem_events", 0)) + 1
+
+    return sorted(
+        by_receiver.values(),
+        key=lambda row: (
+            -int(row.get("problem_events", 0) or 0),
+            -int(row.get("sent_missing_accepted", 0) or 0),
+            -int(row.get("accepted_missing_csv", 0) or 0),
+            str(row.get("receiver_email", "") or ""),
+        ),
+    )
+
+
+def _build_route_lifecycle_summary(lifecycle_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_route: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in list(lifecycle_rows or []):
+        sender_email = str(row.get("sender_email", "") or "").strip().lower() or "unknown"
+        receiver_email = str(row.get("receiver_email", "") or "").strip().lower() or "unknown"
+        route_key = (sender_email, receiver_email)
+        route_entry = by_route.get(route_key)
+        if route_entry is None:
+            route_entry = {
+                "sender_email": sender_email,
+                "receiver_email": receiver_email,
+                "events": 0,
+                "target_resolved": 0,
+                "sent": 0,
+                "accepted": 0,
+                "acked": 0,
+                "csv": 0,
+                "invalid_target": 0,
+                "send_failed": 0,
+                "problem_events": 0,
+            }
+            by_route[route_key] = route_entry
+        route_entry["events"] = int(route_entry.get("events", 0)) + 1
+        if bool(row.get("target_resolved", False)):
+            route_entry["target_resolved"] = int(route_entry.get("target_resolved", 0)) + 1
+        if bool(row.get("sent", False)):
+            route_entry["sent"] = int(route_entry.get("sent", 0)) + 1
+        if bool(row.get("accepted", False)):
+            route_entry["accepted"] = int(route_entry.get("accepted", 0)) + 1
+        if bool(row.get("acked", False)):
+            route_entry["acked"] = int(route_entry.get("acked", 0)) + 1
+        if bool(row.get("csv", False)):
+            route_entry["csv"] = int(route_entry.get("csv", 0)) + 1
+        if bool(row.get("invalid_target", False)):
+            route_entry["invalid_target"] = int(route_entry.get("invalid_target", 0)) + 1
+        if bool(row.get("send_failed", False)):
+            route_entry["send_failed"] = int(route_entry.get("send_failed", 0)) + 1
+        if bool(row.get("problem_event", False)):
+            route_entry["problem_events"] = int(route_entry.get("problem_events", 0)) + 1
+
+    return sorted(
+        by_route.values(),
+        key=lambda row: (
+            -int(row.get("problem_events", 0) or 0),
+            -int(row.get("events", 0) or 0),
+            str(row.get("sender_email", "") or ""),
+            str(row.get("receiver_email", "") or ""),
+        ),
+    )
+
+
 def _summarize(new_drop_rows: list[dict[str, Any]], new_debug_rows: list[dict[str, Any]]) -> dict[str, Any]:
     accepted = [row for row in new_debug_rows if str(row.get("event", "")) == "viewer_drop_accepted"]
     duplicates = [row for row in new_debug_rows if str(row.get("event", "")) == "viewer_drop_duplicate"]
@@ -502,7 +665,11 @@ def _summarize(new_drop_rows: list[dict[str, Any]], new_debug_rows: list[dict[st
     acked = [row for row in new_debug_rows if str(row.get("event", "")) == "tracker_drop_acked"]
     resets = [row for row in new_debug_rows if str(row.get("event", "")).endswith("session_reset")]
     row_name_updates = [row for row in new_debug_rows if str(row.get("event", "")) == "viewer_row_name_updated"]
-    stats_name_mismatches = [row for row in new_debug_rows if str(row.get("event", "")) == "viewer_stats_name_mismatch"]
+    stats_name_mismatches = [
+        row
+        for row in new_debug_rows
+        if str(row.get("event", "")) in {"viewer_stats_name_mismatch", "viewer_selected_stats_name_mismatch"}
+    ]
     target_resolved = [row for row in new_debug_rows if str(row.get("event", "")) == "tracker_transport_target_resolved"]
     rezones = _collect_likely_rezones(new_debug_rows)
     latest_reset_ts = _latest_viewer_reset_ts(new_debug_rows)
@@ -635,29 +802,12 @@ def _summarize(new_drop_rows: list[dict[str, Any]], new_debug_rows: list[dict[st
         new_drop_rows,
         new_debug_rows,
     )
-    if rezones and latest_reset_ts is not None:
-        latest_session_event_ids: set[str] = set()
-        for row in list(accepted_latest_session or []):
-            event_id = str(row.get("event_id", "") or "").strip()
-            if event_id:
-                latest_session_event_ids.add(event_id)
-        for row in list(new_drop_rows or []):
-            event_id = _event_id_from_csv_row(row)
-            if not event_id:
-                continue
-            row_ts = _parse_ts(row.get("Timestamp"))
-            if row_ts is not None and row_ts >= latest_reset_ts:
-                latest_session_event_ids.add(event_id)
-        if latest_session_event_ids:
-            lifecycle_gaps = [
-                gap
-                for gap in list(lifecycle_gaps or [])
-                if (
-                    str(gap.get("code", "") or "").strip() not in {"accepted_missing_csv", "csv_missing_accepted"}
-                    or str(gap.get("event_id", "") or "").strip() in latest_session_event_ids
-                )
-            ]
     sender_lifecycle = _build_sender_lifecycle_summary(lifecycle_rows)
+    receiver_lifecycle = _build_receiver_lifecycle_summary(lifecycle_rows)
+    route_lifecycle = _build_route_lifecycle_summary(lifecycle_rows)
+    problem_lifecycle_rows = [
+        row for row in list(lifecycle_rows or []) if bool(row.get("problem_event", False))
+    ]
 
     return {
         "new_drop_rows": len(new_drop_rows),
@@ -693,8 +843,11 @@ def _summarize(new_drop_rows: list[dict[str, Any]], new_debug_rows: list[dict[st
         "forbidden_rows": forbidden_rows[:24],
         "lifecycle_gaps": lifecycle_gaps[:60],
         "accepted_missing_stats_binding": accepted_missing_stats_binding[:40],
-        "lifecycle_rows": lifecycle_rows[:120],
+        "lifecycle_rows": lifecycle_rows[:180],
+        "problem_lifecycle_rows": problem_lifecycle_rows[:80],
         "sender_lifecycle": sender_lifecycle[:40],
+        "receiver_lifecycle": receiver_lifecycle[:40],
+        "route_lifecycle": route_lifecycle[:60],
         "send_failed_events": send_failed[:20],
         "suppressed_events": suppressed[:12],
         "rezones": rezones[:12],

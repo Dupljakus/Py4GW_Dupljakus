@@ -42,9 +42,9 @@ def test_assess_summary_fails_problem_run():
             "sent_count": 2,
             "acked_count": 0,
             "send_failed_count": 2,
-            "rezone_count": 0,
+            "rezone_count": 1,
             "missing_in_csv": ["Bog Skale Fin x1 (White)"],
-            "latest_session_missing_in_csv": ["Bog Skale Fin x1 (White)"],
+            "latest_session_missing_in_csv": [],
             "missing_in_accepted": [],
             "duplicate_drop_rows": ["Bog Skale Fin x1 (White)"],
             "duplicate_csv_event_ids": ["ev-1"],
@@ -135,6 +135,37 @@ def test_format_report_includes_recent_problem_details():
             "invalid_target_events": [
                 {"sender_email": "follower@test", "receiver_email": "stale@test"}
             ],
+            "receiver_lifecycle": [
+                {
+                    "receiver_email": "leader@test",
+                    "accepted": 1,
+                    "csv": 0,
+                    "sent_missing_accepted": 0,
+                    "accepted_missing_csv": 1,
+                }
+            ],
+            "route_lifecycle": [
+                {
+                    "sender_email": "follower@test",
+                    "receiver_email": "leader@test",
+                    "events": 1,
+                    "sent": 1,
+                    "accepted": 0,
+                    "acked": 0,
+                    "csv": 0,
+                    "problem_events": 1,
+                }
+            ],
+            "problem_lifecycle_rows": [
+                {
+                    "event_id": "ev-problem",
+                    "sender_email": "follower@test",
+                    "receiver_email": "leader@test",
+                    "label": "Half-Eaten Blob x1 (White) [Follower]",
+                    "gap_codes": ["sent_missing_accepted"],
+                    "owner_hints": ["receiver"],
+                }
+            ],
             "rezones": [
                 {
                     "current_map_id": 54,
@@ -152,6 +183,9 @@ def test_format_report_includes_recent_problem_details():
     assert "row=The Flameseeker Prophecies [Hard Mode] bound=Deadly Cesta of Quickening" in rendered
     assert "Half-Eaten Blob -> leader@test" in rendered
     assert "follower@test -> stale@test" in rendered
+    assert "leader@test: accepted=1 csv=0 sent_missing_accepted=0 accepted_missing_csv=1" in rendered
+    assert "follower@test -> leader@test: events=1 sent=1 accepted=0 acked=0 csv=0 problems=1" in rendered
+    assert "ev=ev-problem follower@test -> leader@test gaps=sent_missing_accepted sides=receiver" in rendered
     assert "map=54 uptime_ms=1310" in rendered
 
 
@@ -178,6 +212,51 @@ def test_summarize_detects_forbidden_kit_rows_and_lifecycle_gap():
         str(row.get("code", "") or "").strip() == "csv_missing_accepted"
         for row in list(summary.get("lifecycle_gaps", []) or [])
     )
+
+
+def test_summarize_tracks_sender_receiver_route_and_problem_side():
+    summary = harness._summarize(
+        [],
+        [
+            {
+                "event": "tracker_transport_target_resolved",
+                "event_id": "ev-route-1",
+                "sender_email": "follower@test",
+                "receiver_email": "leader@test",
+                "receiver_in_party": True,
+                "role": "follower",
+                "item_name": "Bone",
+                "ts": "2026-03-05 18:10:00.000",
+            },
+            {
+                "event": "tracker_drop_sent",
+                "event_id": "ev-route-1",
+                "sender_email": "follower@test",
+                "receiver_email": "leader@test",
+                "item_name": "Bone",
+                "ts": "2026-03-05 18:10:00.010",
+            },
+        ],
+    )
+
+    lifecycle_rows = list(summary.get("lifecycle_rows", []) or [])
+    assert len(lifecycle_rows) == 1
+    assert lifecycle_rows[0]["receiver_email"] == "leader@test"
+    assert lifecycle_rows[0]["target_resolved"] is True
+    assert lifecycle_rows[0]["problem_event"] is True
+    assert "sent_missing_accepted" in list(lifecycle_rows[0].get("gap_codes", []) or [])
+
+    receiver_lifecycle = list(summary.get("receiver_lifecycle", []) or [])
+    assert receiver_lifecycle[0]["receiver_email"] == "leader@test"
+    assert int(receiver_lifecycle[0]["sent_missing_accepted"] or 0) == 1
+
+    route_lifecycle = list(summary.get("route_lifecycle", []) or [])
+    assert route_lifecycle[0]["sender_email"] == "follower@test"
+    assert route_lifecycle[0]["receiver_email"] == "leader@test"
+    assert int(route_lifecycle[0]["problem_events"] or 0) == 1
+
+    problem_rows = list(summary.get("problem_lifecycle_rows", []) or [])
+    assert problem_rows[0]["primary_owner_hint"] == "receiver"
 
 
 def test_write_bug_bundle_if_failed_creates_artifact(tmp_path, monkeypatch):
@@ -278,7 +357,7 @@ def test_collect_likely_rezones_clusters_high_uptime_and_startup_resets_on_same_
     assert rezones[0]["reasons"] == ["viewer_instance_reset", "viewer_sync_reset"]
 
 
-def test_summarize_scopes_csv_lifecycle_gaps_to_latest_session_when_rezoned():
+def test_summarize_keeps_csv_lifecycle_gaps_across_rezones():
     summary = harness._summarize(
         [
             {
@@ -327,7 +406,7 @@ def test_summarize_scopes_csv_lifecycle_gaps_to_latest_session_when_rezoned():
 
     lifecycle_gaps = list(summary.get("lifecycle_gaps", []) or [])
     assert int(summary.get("rezone_count", 0) or 0) == 1
-    assert not any(
+    assert any(
         str(row.get("event_id", "")).strip() == "ev-old-missing"
         and str(row.get("code", "")).strip() == "accepted_missing_csv"
         for row in lifecycle_gaps

@@ -95,12 +95,7 @@ def assess_summary(summary: dict[str, Any], policy: dict[str, Any] | None = None
 
     if send_failed_count > int(config.get("max_send_failed_count", 0) or 0):
         failures.append(f"Transport failed for {send_failed_count} tracker send attempt(s).")
-    if rezone_count > 0:
-        if len(latest_session_missing_in_csv) > int(config.get("max_latest_session_missing_in_csv", 0) or 0):
-            failures.append(
-                f"{len(latest_session_missing_in_csv)} accepted drop(s) in latest session never reached drop_log.csv."
-            )
-    elif len(missing_in_csv) > int(config.get("max_missing_in_csv", 0) or 0):
+    if len(missing_in_csv) > int(config.get("max_missing_in_csv", 0) or 0):
         failures.append(f"{len(missing_in_csv)} accepted drop(s) never reached drop_log.csv.")
     if len(missing_in_accepted) > int(config.get("max_missing_in_accepted", 0) or 0):
         failures.append(f"{len(missing_in_accepted)} CSV row(s) have no matching accepted viewer event.")
@@ -151,7 +146,10 @@ def format_report(summary: dict[str, Any]) -> str:
         ),
         f"Rezones Detected: {int(summary.get('rezone_count', 0) or 0)}",
     ]
+    missing_in_csv = list(summary.get("missing_in_csv", []))
     latest_session_missing_in_csv = list(summary.get("latest_session_missing_in_csv", []))
+    if missing_in_csv:
+        lines.append(f"Missing In CSV: {len(missing_in_csv)}")
     if latest_session_missing_in_csv:
         lines.append(f"Latest Session Missing In CSV: {len(latest_session_missing_in_csv)}")
 
@@ -218,7 +216,12 @@ def format_report(summary: dict[str, Any]) -> str:
             code = str(row.get("code", "") or "").strip() or "unknown"
             event_id = str(row.get("event_id", "") or "").strip() or "-"
             label = str(row.get("label", "") or "").strip() or "Unknown Item"
-            lines.append(f"- {code} ev={event_id} {label}")
+            owner_hint = str(row.get("owner_hint", "") or "").strip() or "unknown"
+            sender = str(row.get("sender_email", "") or "").strip() or "unknown-sender"
+            receiver = str(row.get("receiver_email", "") or "").strip() or "unknown-receiver"
+            lines.append(
+                f"- {code} side={owner_hint} ev={event_id} {sender} -> {receiver} {label}"
+            )
 
     sender_lifecycle = list(summary.get("sender_lifecycle", []))
     if sender_lifecycle:
@@ -228,7 +231,61 @@ def format_report(summary: dict[str, Any]) -> str:
             accepted = int(row.get("accepted", 0) or 0)
             csv = int(row.get("csv", 0) or 0)
             stats_missing = int(row.get("accepted_missing_stats_binding", 0) or 0)
-            lines.append(f"- {sender_email}: accepted={accepted} csv={csv} stats_missing={stats_missing}")
+            problems = int(row.get("problem_events", 0) or 0)
+            lines.append(
+                f"- {sender_email}: accepted={accepted} csv={csv} stats_missing={stats_missing} problems={problems}"
+            )
+
+    receiver_lifecycle = list(summary.get("receiver_lifecycle", []))
+    if receiver_lifecycle:
+        lines.append("Per-Receiver Lifecycle:")
+        for row in receiver_lifecycle[:8]:
+            receiver_email = str(row.get("receiver_email", "") or "").strip() or "unknown"
+            accepted = int(row.get("accepted", 0) or 0)
+            csv = int(row.get("csv", 0) or 0)
+            sent_missing_accepted = int(row.get("sent_missing_accepted", 0) or 0)
+            accepted_missing_csv = int(row.get("accepted_missing_csv", 0) or 0)
+            lines.append(
+                f"- {receiver_email}: accepted={accepted} csv={csv} sent_missing_accepted={sent_missing_accepted} accepted_missing_csv={accepted_missing_csv}"
+            )
+
+    route_lifecycle = list(summary.get("route_lifecycle", []))
+    if route_lifecycle:
+        lines.append("Sender/Receiver Routes:")
+        for row in route_lifecycle[:10]:
+            sender_email = str(row.get("sender_email", "") or "").strip() or "unknown-sender"
+            receiver_email = str(row.get("receiver_email", "") or "").strip() or "unknown-receiver"
+            events = int(row.get("events", 0) or 0)
+            sent = int(row.get("sent", 0) or 0)
+            accepted = int(row.get("accepted", 0) or 0)
+            acked = int(row.get("acked", 0) or 0)
+            csv = int(row.get("csv", 0) or 0)
+            problems = int(row.get("problem_events", 0) or 0)
+            lines.append(
+                f"- {sender_email} -> {receiver_email}: events={events} sent={sent} accepted={accepted} acked={acked} csv={csv} problems={problems}"
+            )
+
+    problem_lifecycle_rows = list(summary.get("problem_lifecycle_rows", []))
+    if problem_lifecycle_rows:
+        lines.append("Problem Events:")
+        for row in problem_lifecycle_rows[:12]:
+            event_id = str(row.get("event_id", "") or "").strip() or "-"
+            sender_email = str(row.get("sender_email", "") or "").strip() or "unknown-sender"
+            receiver_email = str(row.get("receiver_email", "") or "").strip() or "unknown-receiver"
+            label = str(row.get("label", "") or "").strip() or "Unknown Item"
+            gap_codes = [
+                str(value or "").strip()
+                for value in list(row.get("gap_codes", []) or [])
+                if str(value or "").strip()
+            ]
+            owner_hints = [
+                str(value or "").strip()
+                for value in list(row.get("owner_hints", []) or [])
+                if str(value or "").strip()
+            ]
+            lines.append(
+                f"- ev={event_id} {sender_email} -> {receiver_email} gaps={','.join(gap_codes) or 'unknown'} sides={','.join(owner_hints) or 'unknown'} {label}"
+            )
 
     rezones = list(summary.get("rezones", []))
     if rezones:
@@ -263,6 +320,7 @@ def _extract_focus_event_ids(summary: dict[str, Any]) -> list[str]:
         list(summary.get("suspicious_name_updates", [])),
         list(summary.get("invalid_target_events", [])),
         list(summary.get("forbidden_rows", [])),
+        list(summary.get("problem_lifecycle_rows", [])),
     ]
     for rows in candidate_lists:
         for row in list(rows or []):

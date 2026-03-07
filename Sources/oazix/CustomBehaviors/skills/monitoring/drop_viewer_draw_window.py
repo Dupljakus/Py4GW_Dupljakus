@@ -169,6 +169,27 @@ def _draw_main_gui(viewer, pyimgui, imgui, map_api, player_api, py4gw_api):
                 pyimgui.close_current_popup()
             pyimgui.end_popup_modal()
 
+        if bool(getattr(viewer, "selected_name_mismatch_popup_pending", False)):
+            pyimgui.open_popup("SelectedNameMismatchAlert")
+            viewer.selected_name_mismatch_popup_pending = False
+        selected_name_mismatch_popup_until = float(getattr(viewer, "selected_name_mismatch_popup_until", 0.0) or 0.0)
+        if pyimgui.begin_popup_modal("SelectedNameMismatchAlert", True, pyimgui.WindowFlags.AlwaysAutoResize):
+            pyimgui.text_colored("Selected Item Mismatch", (1.0, 0.58, 0.24, 1.0))
+            pyimgui.separator()
+            popup_msg = viewer._ensure_text(getattr(viewer, "selected_name_mismatch_popup_message", "")).strip()
+            if popup_msg:
+                pyimgui.text_wrapped(popup_msg)
+            remaining_s = max(0.0, selected_name_mismatch_popup_until - time.time())
+            pyimgui.separator()
+            pyimgui.text_colored(f"Closing in {remaining_s:.1f}s", (0.78, 0.78, 0.78, 1.0))
+            if remaining_s <= 0.0:
+                viewer.selected_name_mismatch_popup_until = 0.0
+                pyimgui.close_current_popup()
+            elif viewer._styled_button("Close", "secondary"):
+                viewer.selected_name_mismatch_popup_until = 0.0
+                pyimgui.close_current_popup()
+            pyimgui.end_popup_modal()
+
         pyimgui.same_line(0.0, 40.0)
         if viewer._styled_button("Clear/Reset", "danger", tooltip="Clear live file and in-memory drop stats"):
             try:
