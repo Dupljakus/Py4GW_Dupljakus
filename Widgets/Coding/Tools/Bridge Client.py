@@ -1,6 +1,7 @@
 import os
 import queue
 import socket
+import shutil
 import subprocess
 import threading
 import time
@@ -245,11 +246,71 @@ def _is_port_listening(host: str, port_value: int, timeout_s: float = 0.2) -> bo
                 pass
 
 
+def _is_safe_python_executable(path: str) -> bool:
+    candidate = str(path or "").strip()
+    if not candidate:
+        return False
+    filename = os.path.basename(candidate).strip().lower()
+    if not filename:
+        return False
+    if filename in {"gw.exe", "guildwars.exe", "guild wars.exe"}:
+        return False
+    if filename.startswith("python"):
+        return True
+    return filename in {"py.exe", "py"}
+
+
+def _iter_python_launch_candidates() -> list[list[str]]:
+    candidates: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def add(command: list[str]) -> None:
+        normalized = tuple(str(part or "").strip() for part in command if str(part or "").strip())
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append(list(normalized))
+
+    env_python = str(os.environ.get("PY4GW_PYTHON_EXE") or "").strip()
+    if env_python and os.path.exists(env_python) and _is_safe_python_executable(env_python):
+        add([env_python])
+
+    for attr_name in ("_base_executable", "executable"):
+        executable = str(getattr(sys, attr_name, "") or "").strip()
+        if executable and os.path.exists(executable) and _is_safe_python_executable(executable):
+            add([executable])
+
+    python_on_path = shutil.which("python")
+    if python_on_path and _is_safe_python_executable(python_on_path):
+        add([python_on_path])
+
+    py_launcher = shutil.which("py")
+    if py_launcher and _is_safe_python_executable(py_launcher):
+        add([py_launcher, "-3"])
+
+    local_programs = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "Programs",
+        "Python",
+    )
+    if local_programs and os.path.isdir(local_programs):
+        try:
+            install_dirs = sorted(os.listdir(local_programs), reverse=True)
+        except OSError:
+            install_dirs = []
+        for install_dir in install_dirs:
+            python_exe = os.path.join(local_programs, install_dir, "python.exe")
+            if os.path.exists(python_exe) and _is_safe_python_executable(python_exe):
+                add([python_exe])
+
+    return candidates
+
+
 def _python_launch_command() -> list[str]:
-    executable = str(getattr(sys, "executable", "") or "").strip()
-    if executable:
-        return [executable]
-    return ["py", "-3"]
+    candidates = _iter_python_launch_candidates()
+    if candidates:
+        return candidates[0]
+    return []
 
 
 def _ensure_local_bridge_daemon() -> None:
@@ -269,6 +330,9 @@ def _ensure_local_bridge_daemon() -> None:
         return
 
     cmd = _python_launch_command()
+    if not cmd:
+        STATE.last_error = "autostart: no safe python interpreter found for bridge daemon"
+        return
     cmd.extend(
         [
             daemon_script,

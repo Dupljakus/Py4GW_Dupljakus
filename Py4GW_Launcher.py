@@ -1,7 +1,5 @@
 from imgui_bundle import hello_imgui, imgui
 import json
-import tkinter as tk
-from tkinter import filedialog
 
 
 #region --- patcher ---
@@ -171,7 +169,10 @@ class IniHandler:
             self.save(config)
 
 
-current_directory = os.getcwd()
+if getattr(sys, "frozen", False):
+    current_directory = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    current_directory = os.path.dirname(os.path.abspath(__file__))
 ini_file = "Py4GW.ini"
 ini_handler = IniHandler(ini_file)
 '''For Future Use'''
@@ -657,7 +658,67 @@ class GWLauncher:
 
     def __init__(self):     
         self.active_pids = []
+        self.launch_in_progress_keys = set()
+        self.team_launch_in_progress_names = set()
         self.gmod_injection_delay = 0.5  # Delay before gMod injection (configurable)
+
+    def _account_launch_key(self, account: Account) -> tuple[str, str, str]:
+        email_key = str(getattr(account, "email", "") or "").strip().lower()
+        character_key = str(getattr(account, "character_name", "") or "").strip().lower()
+        gw_path_key = str(getattr(account, "gw_path", "") or "").strip().lower()
+        return email_key, character_key, gw_path_key
+
+    def _team_launch_key(self, team: Team) -> str:
+        return str(getattr(team, "name", "") or "").strip().lower()
+
+    def _accounts_match(self, left: Account, right: Account) -> bool:
+        left_key = self._account_launch_key(left)
+        right_key = self._account_launch_key(right)
+        if left_key[0] and right_key[0]:
+            return left_key[0] == right_key[0]
+        if left_key[1] and right_key[1] and left_key[2] and right_key[2]:
+            return left_key[1] == right_key[1] and left_key[2] == right_key[2]
+        return left_key == right_key
+
+    def _normalize_executable_path(self, path: str) -> str:
+        normalized = str(path or "").strip()
+        if not normalized:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(normalized)))
+
+    def _prune_inactive_pids(self):
+        pruned = []
+        for active_account, pid in list(self.active_pids):
+            if self.is_process_running(pid):
+                pruned.append((active_account, pid))
+        self.active_pids = pruned
+
+    def _find_active_pid_for_account(self, account: Account) -> Optional[int]:
+        self._prune_inactive_pids()
+        for active_account, pid in self.active_pids:
+            if self._accounts_match(active_account, account):
+                return int(pid)
+        return None
+
+    def _find_running_pid_for_gw_path(self, gw_path: str) -> Optional[int]:
+        normalized_target = self._normalize_executable_path(gw_path)
+        if not normalized_target:
+            return None
+
+        for process in psutil.process_iter(["pid", "exe"]):
+            try:
+                process_exe = self._normalize_executable_path(process.info.get("exe") or "")
+                if process_exe and process_exe == normalized_target:
+                    return int(process.info["pid"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                continue
+        return None
+
+    def _find_existing_pid_for_account(self, account: Account) -> Optional[int]:
+        existing_pid = self._find_active_pid_for_account(account)
+        if existing_pid:
+            return existing_pid
+        return self._find_running_pid_for_gw_path(account.gw_path)
 
     def wait_for_gw_window(self, pid, timeout=30):
         """Wait for GW window to be created and fully loaded"""
@@ -818,7 +879,9 @@ class GWLauncher:
             log_history.append("GWBlackBox DLL path not valid")
             return False
 
-        log_history.append(f"Injecting BlackBox from: {os.path.join(current_directory, "Addons", blackbox_dll_name)}")
+        log_history.append(
+            f"Injecting BlackBox from: {os.path.join(current_directory, 'Addons', blackbox_dll_name)}"
+        )
         
         # Store original DLL path
         original_dll_path = os.path.join(current_directory, "Addons", blackbox_dll_name)
@@ -924,26 +987,56 @@ class GWLauncher:
             log_history.append(f"Error updating modlist.txt at {modlist_path}: {str(e)}")
 
     def start_team_launch_thread(self, team):
+        team_key = self._team_launch_key(team)
+        if team_key in self.team_launch_in_progress_names:
+            log_history.append(f"Launch Team - Skipping duplicate in-progress team launch for {team.name}")
+            return
+
         def team_launch_thread():
+            launched_keys_this_thread = set()
             log_history.append(f"Launching team: {team.name}")
-            for account in team.accounts:
-                self.launch_gw(account)
+            self.team_launch_in_progress_names.add(team_key)
+            try:
+                for account in team.accounts:
+                    launch_key = self._account_launch_key(account)
+                    if launch_key in launched_keys_this_thread:
+                        log_history.append(
+                            f"Launch Team - Skipping duplicate account entry for {account.character_name or account.email}"
+                        )
+                        continue
+                    launched_keys_this_thread.add(launch_key)
+                    self.launch_gw(account)
 
-                # Dynamic idle message update
-                idle_time = 15  # Seconds
-                for remaining in range(idle_time, 0, -1):
-                    log_history[-1] = f"Idling... {remaining}s remaining to prevent log-in throttle"
-                    time.sleep(1)  # Sleep 1 second and update countdown dynamically
+                    # Dynamic idle message update
+                    idle_time = 15  # Seconds
+                    for remaining in range(idle_time, 0, -1):
+                        log_history[-1] = f"Idling... {remaining}s remaining to prevent log-in throttle"
+                        time.sleep(1)  # Sleep 1 second and update countdown dynamically
 
-                log_history.append("Idle complete, continuing...")
+                    log_history.append("Idle complete, continuing...")
 
-            log_history.append(f"Finished launching team: {team.name}")
+                log_history.append(f"Finished launching team: {team.name}")
+            finally:
+                self.team_launch_in_progress_names.discard(team_key)
 
         # Start the thread for launching the team
         threading.Thread(target=team_launch_thread, daemon=True).start()
 
     def launch_gw(self, account: Account):
         patcher = Patcher()
+        launch_key = self._account_launch_key(account)
+        if launch_key in self.launch_in_progress_keys:
+            log_history.append(
+                f"Launch GW - Skipping duplicate in-progress launch for {account.character_name or account.email}"
+            )
+            return
+        existing_pid = self._find_existing_pid_for_account(account)
+        if existing_pid:
+            log_history.append(
+                f"Launch GW - Skipping duplicate launch for {account.character_name or account.email}; PID {existing_pid} is already running"
+            )
+            return
+        self.launch_in_progress_keys.add(launch_key)
         try:
             pid = patcher.launch_and_patch(
                 account.gw_path,
@@ -1013,10 +1106,12 @@ class GWLauncher:
 
                 kernel32.CloseHandle(process_info.hProcess)
                 kernel32.CloseHandle(process_info.hThread)
-                """
+            """
             #threading.Thread(target=self.monitor_game_process, args=(account, pid), daemon=True).start()
         except Exception as e:
             log_history.append(f"Error launching GW: {str(e)}")
+        finally:
+            self.launch_in_progress_keys.discard(launch_key)
 
 
 # -------------------------------------------------#
@@ -1420,66 +1515,77 @@ def save_teams_to_json(name):
         except Exception as e:
             log_history.append(f"Error saving teams: {e}")
 
+def _create_hidden_tk_root():
+    try:
+        import tkinter as tk
+    except ImportError:
+        log_history.append("Tkinter is not available in this launcher build.")
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    return root
+
+def _ask_open_filename(**kwargs):
+    root = _create_hidden_tk_root()
+    if root is None:
+        return ""
+    try:
+        from tkinter import filedialog
+        return str(filedialog.askopenfilename(**kwargs) or "")
+    finally:
+        root.destroy()
+
+def _ask_directory(**kwargs):
+    root = _create_hidden_tk_root()
+    if root is None:
+        return ""
+    try:
+        from tkinter import filedialog
+        return str(filedialog.askdirectory(**kwargs) or "")
+    finally:
+        root.destroy()
+
 def select_folder():
     """
     Open a folder selection dialog and return the selected folder path.
     """
-    root = tk.Tk()
-    root.withdraw()  # Hide the main Tkinter window
-    folder_path = filedialog.askdirectory(title="Select Guild Wars Path")
-    root.destroy()
-    return folder_path
+    return _ask_directory(title="Select Guild Wars Path")
 
 def select_gw_exe():
     """
     Open a file selection dialog to select the 'Gw.exe' file.
     """
-    root = tk.Tk()
-    root.withdraw()  # Hide the main Tkinter window
-    file_path = filedialog.askopenfilename(
+    return _ask_open_filename(
         title="Select Guild Wars Executable",
         filetypes=[("Executable Files", "*.exe")],  # Restrict to .exe files
         initialfile="Gw.exe"  # Suggest Gw.exe as the default file
     )
-    root.destroy()
-    return file_path
 
 def select_dll(name):
     """
     Open a file selection dialog to select the 'DLL' file.
     """
-    root = tk.Tk()
-    root.withdraw()  # Hide the main Tkinter window
-    file_path = filedialog.askopenfilename(
+    return _ask_open_filename(
         title="Select DLL",
         filetypes=[("dynamic Libraries", "*.dll")],  # Restrict to .exe files
         initialfile=name  # Suggest Gw.exe as the default file
     )
-    root.destroy()
-    return file_path
 
 def select_python_script():
     """
     Open a file selection dialog to select the 'DLL' file.
     """
-    root = tk.Tk()
-    root.withdraw()  # Hide the main Tkinter window
-    file_path = filedialog.askopenfilename(
+    return _ask_open_filename(
         title="Select Python script",
         filetypes=[("Python Scripts", "*.py")]  # Restrict to .exe files
     )
-    root.destroy()
-    return file_path
 
 # Function for mod selection
 def select_mod_file():
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(
+    file_path = _ask_open_filename(
         title="Select Mod File",
         filetypes=[("Mod Files", "*.tpf")]
     )
-    root.destroy()
     if file_path:
         # Return the full path directly
         log_history.append(f"Selected mod file: {file_path}")
