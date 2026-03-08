@@ -548,6 +548,38 @@ def test_poll_shared_memory_handles_inventory_action_from_c_wchar_payload(monkey
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_poll_shared_memory_marks_tracker_message_finished_on_parse_error(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    viewer.max_shmem_messages_per_tick = 8
+    viewer.max_shmem_scan_per_tick = 20
+
+    def _raise_parse_error(*_args, **_kwargs):
+        raise ValueError("forced parse failure")
+
+    monkeypatch.setattr(module, "process_tracker_drop_message", _raise_parse_error, raising=False)
+    py4gw_mod.GLOBAL_CACHE.ShMem = _FakeShMem(
+        [
+            (
+                0,
+                _FakeSharedMsg(
+                    receiver_email="self@test",
+                    sender_email="peer@test",
+                    command=997,
+                    extra_data=["TrackerDrop", "Item Name", "White", "v3|ev-1|sig|0001"],
+                ),
+            )
+        ]
+    )
+
+    try:
+        viewer._poll_shared_memory()
+        assert py4gw_mod.GLOBAL_CACHE.ShMem.finished == [0]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_run_inventory_action_sell_gold_recovers_stale_outpost_lock(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
@@ -1097,8 +1129,127 @@ def test_update_resets_existing_rows_on_map_change(monkeypatch):
         assert viewer.total_drops == 0
         assert viewer.map_change_ignore_until > 0.0
         assert viewer.status_message == "Auto reset on map change"
-        assert py4gw_mod.GLOBAL_CACHE.ShMem.finished == [0]
-        assert len(log_store_module.parse_drop_log_file(viewer.log_path)) == 1
+        assert py4gw_mod.GLOBAL_CACHE.ShMem.finished == [0, 0]
+        parsed_rows = log_store_module.parse_drop_log_file(viewer.log_path)
+        assert len(parsed_rows) == 2
+        assert parsed_rows[-1].event_id == "ev-old"
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_process_chat_message_logs_pickup_debug_event(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    viewer.enable_chat_item_tracking = True
+    viewer.recent_log_cache = {}
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    tracked: list[tuple[str, str, int, str]] = []
+    monkeypatch.setattr(viewer, "_is_recent_duplicate", lambda *_args, **_kwargs: False, raising=False)
+    monkeypatch.setattr(
+        viewer,
+        "_append_live_debug_log",
+        lambda event, message, **fields: logged.append((str(event), str(message), dict(fields))),
+    )
+    monkeypatch.setattr(
+        viewer,
+        "_log_drop_to_file",
+        lambda player_name, item_name, quantity, rarity, *args, **kwargs: tracked.append(
+            (str(player_name), str(item_name), int(quantity), str(rarity))
+        ),
+    )
+
+    try:
+        module.process_chat_message(viewer, "[10:31 pm] Mesmer Tri picks up the Stone Summit Badge.")
+        assert tracked == [("Mesmer Tri", "Stone Summit Badge", 1, "Unknown")]
+        assert logged
+        assert logged[0][0] == "viewer_chat_pickup_observed"
+        assert logged[0][2]["player_name"] == "Mesmer Tri"
+        assert logged[0][2]["item_name"] == "Stone Summit Badge"
+        assert int(logged[0][2]["quantity"]) == 1
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_process_chat_message_dedupes_repeated_pickup_without_monkeypatch_helpers(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    viewer.enable_chat_item_tracking = True
+    viewer.chat_dedupe_window_s = 5.0
+    viewer.recent_log_cache = {}
+    tracked: list[tuple[str, str, int, str]] = []
+    monkeypatch.setattr(
+        viewer,
+        "_log_drop_to_file",
+        lambda player_name, item_name, quantity, rarity, *args, **kwargs: tracked.append(
+            (str(player_name), str(item_name), int(quantity), str(rarity))
+        ),
+    )
+    monkeypatch.setattr(viewer, "_append_live_debug_log", lambda *args, **kwargs: None)
+
+    try:
+        message = "[10:31 pm] Mesmer Tri picks up the Stone Summit Badge."
+        module.process_chat_message(viewer, message)
+        module.process_chat_message(viewer, message)
+        assert tracked == [("Mesmer Tri", "Stone Summit Badge", 1, "Unknown")]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_update_replays_chat_messages_since_reset_floor(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    viewer.enable_chat_item_tracking = True
+    viewer.last_update_time = 0.0
+    viewer.last_seen_map_id = 93
+    viewer.last_seen_instance_uptime_ms = 5000
+    viewer.chat_requested = True
+    viewer.last_chat_index = -1
+    viewer.chat_bootstrap_floor_index = 1
+    viewer.recent_log_cache = {}
+
+    logged: list[tuple[str, str, dict[str, object]]] = []
+    tracked: list[tuple[str, str, int, str]] = []
+    chat_history = [
+        "[11:42 pm] Old Player picks up the Old Item.",
+        "[11:43 pm] Mesmer Tri picks up the Water Wand.",
+        "[11:43 pm] Ritualist Sestt picks up the Water Staff.",
+    ]
+
+    monkeypatch.setattr(viewer, "_is_recent_duplicate", lambda *_args, **_kwargs: False, raising=False)
+    monkeypatch.setattr(
+        viewer,
+        "_append_live_debug_log",
+        lambda event, message, **fields: logged.append((str(event), str(message), dict(fields))),
+    )
+    monkeypatch.setattr(
+        viewer,
+        "_log_drop_to_file",
+        lambda player_name, item_name, quantity, rarity, *args, **kwargs: tracked.append(
+            (str(player_name), str(item_name), int(quantity), str(rarity))
+        ),
+    )
+    monkeypatch.setattr(module.Map, "GetMapID", lambda: 93)
+    monkeypatch.setattr(module.Map, "GetInstanceUptime", lambda: 5200, raising=False)
+    monkeypatch.setattr(module.Player, "IsChatHistoryReady", lambda: True)
+    monkeypatch.setattr(module.Player, "GetChatHistory", lambda: chat_history)
+
+    try:
+        viewer.update()
+        assert tracked == [
+            ("Mesmer Tri", "Water Wand", 1, "Unknown"),
+            ("Ritualist Sestt", "Water Staff", 1, "Unknown"),
+        ]
+        assert logged
+        assert logged[0][0] == "viewer_runtime_heartbeat"
+        assert [entry[0] for entry in logged[1:]] == [
+            "viewer_chat_pickup_observed",
+            "viewer_chat_pickup_observed",
+        ]
+        assert viewer.last_chat_index == len(chat_history)
+        assert viewer.chat_bootstrap_floor_index == -1
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -1157,6 +1308,8 @@ def test_update_resets_existing_rows_on_instance_change(monkeypatch):
         assert viewer.raw_drops == []
         assert viewer.total_drops == 0
         assert viewer.status_message == "Auto reset on map change"
+        assert viewer.last_chat_index == -1
+        assert viewer.chat_bootstrap_floor_index == 0
         assert fake_sender.resets == 1
         assert fake_sender.last_seen_map_id == 1
         assert fake_sender.last_seen_instance_uptime_ms == 100
@@ -1285,6 +1438,46 @@ def test_update_accepts_drop_when_sender_session_matches_floor(monkeypatch):
         viewer.update()
         assert viewer.total_drops == 1
         assert viewer.raw_drops[0][5] == "Current Item"
+        assert py4gw_mod.GLOBAL_CACHE.ShMem.finished == [0]
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_poll_shared_memory_persists_tracker_drop_immediately(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    viewer.max_shmem_messages_per_tick = 8
+    viewer.max_shmem_scan_per_tick = 20
+
+    log_calls: list[list[dict[str, object]]] = []
+    original_log_batch = viewer._log_drops_batch
+
+    def _record_log_batch(entries):
+        captured = [dict(entry) for entry in entries]
+        log_calls.append(captured)
+        return original_log_batch(entries)
+
+    viewer._log_drops_batch = _record_log_batch
+    py4gw_mod.GLOBAL_CACHE.ShMem = _FakeShMem([
+        (
+            0,
+            _FakeSharedMsg(
+                receiver_email="self@test",
+                sender_email="peer@test",
+                command=997,
+                extra_data=["TrackerDrop", "Icy Lodestone", "White", "v3|ev-persist||0001"],
+                params=(1.0, 42.0, 424.0, 0.0),
+            ),
+        ),
+    ])
+
+    try:
+        viewer._poll_shared_memory()
+        assert len(log_calls) == 1
+        assert log_calls[0][0]["event_id"] == "ev-persist"
+        assert viewer.total_drops == 1
+        assert viewer.raw_drops[0][5] == "Icy Lodestone"
         assert py4gw_mod.GLOBAL_CACHE.ShMem.finished == [0]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
@@ -1456,26 +1649,128 @@ def test_sender_carryover_baseline_tracks_early_pickup_after_instance_change(mon
         assert sender.session_startup_pending is True
 
         sender._process_inventory_deltas()
-        assert queued_events == []
-        assert sender.session_startup_pending is True
-
-        sender.recent_world_item_disappearances = [
-            {
-                "agent_id": 9001,
-                "item_id": 43,
-                "model_id": 600,
-                "qty": 1,
-                "rarity": "Blue",
-                "name": "New Item",
-                "disappeared_at": time.time(),
-            }
-        ]
-        sender._process_inventory_deltas()
         assert queued_events == [("New Item", 1, "Blue", 43, 600)]
         assert sender.session_startup_pending is False
         assert sender.carryover_inventory_snapshot == {}
         assert sender.last_inventory_snapshot == new_snapshot
     finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_sender_reset_seeds_carryover_from_live_snapshot_when_cached_snapshot_missing(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender = module.DropTrackerSender()
+    baseline_snapshot = {
+        (1, 1): ("Old Item", "White", 1, 500, 42),
+    }
+    new_snapshot = {
+        (1, 1): ("Old Item", "White", 1, 500, 42),
+        (1, 2): ("New Item", "Blue", 1, 600, 43),
+    }
+    sender.last_inventory_snapshot = {}
+    sender.is_warmed_up = True
+    sender.pending_slot_deltas = {}
+    sender.last_reset_reason = ""
+    sender.last_reset_map_id = 0
+    sender.last_reset_instance_uptime_ms = 0
+    sender.last_reset_started_at = 0.0
+
+    queued_events: list[tuple[str, int, str, int, int]] = []
+    snapshots = [
+        (baseline_snapshot, 1, 1),
+        (new_snapshot, 2, 2),
+        (new_snapshot, 2, 2),
+    ]
+
+    def _fake_take_inventory_snapshot():
+        snapshot, total, ready = snapshots.pop(0)
+        sender.last_snapshot_total = total
+        sender.last_snapshot_ready = ready
+        sender.last_snapshot_not_ready = max(0, total - ready)
+        return snapshot
+
+    monkeypatch.setattr(sender, "_take_inventory_snapshot", _fake_take_inventory_snapshot)
+    monkeypatch.setattr(
+        sender,
+        "_queue_drop",
+        lambda item_name, quantity, rarity, _time_str, item_id, model_id, *_args, **_kwargs: queued_events.append(
+            (str(item_name), int(quantity), str(rarity), int(item_id), int(model_id))
+        ),
+    )
+    monkeypatch.setattr(sender, "_flush_outbox", lambda: 0)
+
+    try:
+        sender._begin_new_session("instance_change", 1, 100)
+        assert sender.carryover_inventory_snapshot == baseline_snapshot
+        assert sender.session_startup_pending is True
+
+        sender._process_inventory_deltas()
+        assert queued_events == [("New Item", 1, "Blue", 43, 600)]
+        assert sender.session_startup_pending is False
+        assert sender.last_inventory_snapshot == new_snapshot
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_sender_instance_change_carryover_requires_world_confirmation_for_loose_existing_matches(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender = module.DropTrackerSender()
+    old_snapshot = {
+        (1, 1): ("Composite Bow", "Purple", 1, 131, 101),
+        (1, 2): ("Earth Staff", "Gold", 1, 602, 102),
+        (1, 3): ("Scroll of Adventurer's Insight", "Blue", 1, 5853, 103),
+    }
+    reshuffled_snapshot = {
+        (1, 4): ("Composite Bow of Defense", "Purple", 1, 131, 201),
+        (1, 5): ("Insightful Earth Staff", "Gold", 1, 602, 202),
+        (1, 6): ("Scrolls of Adventurer's Insight", "Blue", 2, 5853, 203),
+    }
+    sender.last_inventory_snapshot = dict(old_snapshot)
+    sender.is_warmed_up = True
+    sender.pending_slot_deltas = {}
+    sender.last_reset_reason = ""
+    sender.last_reset_map_id = 0
+    sender.last_reset_instance_uptime_ms = 0
+    sender.last_reset_started_at = 0.0
+
+    queued_events: list[tuple[str, int, str, int, int]] = []
+    snapshots = [
+        (reshuffled_snapshot, 3, 3),
+        (reshuffled_snapshot, 3, 3),
+    ]
+
+    def _fake_take_inventory_snapshot():
+        snapshot, total, ready = snapshots.pop(0)
+        sender.last_snapshot_total = total
+        sender.last_snapshot_ready = ready
+        sender.last_snapshot_not_ready = max(0, total - ready)
+        return snapshot
+
+    monkeypatch.setattr(sender, "_take_inventory_snapshot", _fake_take_inventory_snapshot)
+    monkeypatch.setattr(
+        sender,
+        "_queue_drop",
+        lambda item_name, quantity, rarity, _time_str, item_id, model_id, *_args, **_kwargs: queued_events.append(
+            (str(item_name), int(quantity), str(rarity), int(item_id), int(model_id))
+        ),
+    )
+    monkeypatch.setattr(sender, "_flush_outbox", lambda: 0)
+
+    try:
+        sender._begin_new_session("instance_change", 1, 100)
+
+        sender._process_inventory_deltas()
+        assert queued_events == []
+        assert queued_events == []
+        assert sender.session_startup_pending is False
+        assert sender.last_inventory_snapshot == reshuffled_snapshot
+    finally:
+        sender.carryover_inventory_snapshot = {}
+        sender.carryover_suppression_until = 0.0
+        sender.session_startup_pending = False
+        sender.last_inventory_snapshot = {}
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
@@ -1494,6 +1789,14 @@ def test_sender_carryover_baseline_ignores_existing_inventory_when_item_ids_chur
     sender.last_inventory_snapshot = dict(old_snapshot)
     sender.is_warmed_up = True
     sender.pending_slot_deltas = {}
+    sender.carryover_inventory_snapshot = {}
+    sender.carryover_suppression_until = 0.0
+    sender.session_startup_pending = False
+    sender.stable_snapshot_count = 0
+    sender.last_reset_reason = ""
+    sender.last_reset_map_id = 0
+    sender.last_reset_instance_uptime_ms = 0
+    sender.last_reset_started_at = 0.0
 
     queued_events: list[tuple[str, int, str, int, int]] = []
     snapshots = [
@@ -1523,12 +1826,135 @@ def test_sender_carryover_baseline_ignores_existing_inventory_when_item_ids_chur
 
         sender._process_inventory_deltas()
         assert queued_events == []
-
-        sender._process_inventory_deltas()
         assert queued_events == []
         assert sender.last_inventory_snapshot == remapped_snapshot
         assert sender.session_startup_pending is False
         assert sender.carryover_inventory_snapshot == {}
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_sender_tick_processes_immediate_startup_scan_after_instance_change(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender_module = sys.modules[module.DropTrackerSender.__module__]
+    tick_module = sys.modules["Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_tick_runtime"]
+    sender = module.DropTrackerSender()
+    sender.last_seen_map_id = 1
+    sender.last_seen_instance_uptime_ms = 5000
+    sender.last_inventory_snapshot = {
+        (1, 1): ("Old Item", "White", 1, 500, 42),
+    }
+    sender.is_warmed_up = True
+
+    queued_events: list[tuple[str, int, str, int, int]] = []
+    logged_events: list[str] = []
+    snapshots = [
+        {
+            (1, 1): ("Old Item", "White", 1, 500, 42),
+            (1, 2): ("New Item", "Blue", 1, 600, 43),
+        }
+    ]
+
+    def _fake_take_inventory_snapshot():
+        snapshot = snapshots.pop(0)
+        sender.last_snapshot_total = len(snapshot)
+        sender.last_snapshot_ready = len(snapshot)
+        sender.last_snapshot_not_ready = 0
+        return snapshot
+
+    monkeypatch.setattr(tick_module, "read_current_map_instance", lambda: (1, 100))
+    monkeypatch.setattr(tick_module.Routines.Checks.Map, "MapValid", lambda: True)
+    monkeypatch.setattr(sender, "_take_inventory_snapshot", _fake_take_inventory_snapshot)
+    monkeypatch.setattr(
+        sender,
+        "_append_live_debug_log",
+        lambda event, *_args, **_kwargs: logged_events.append(str(event or "").strip()),
+    )
+    monkeypatch.setattr(
+        sender,
+        "_queue_drop",
+        lambda item_name, quantity, rarity, _time_str, item_id, model_id, *_args, **_kwargs: queued_events.append(
+            (str(item_name), int(quantity), str(rarity), int(item_id), int(model_id))
+        ),
+    )
+    monkeypatch.setattr(sender, "_flush_outbox", lambda: 0)
+
+    try:
+        sender.act()
+        assert "sender_post_reset_scan_scheduled" in logged_events
+        assert "sender_startup_completed" in logged_events
+        assert queued_events == [("New Item", 1, "Blue", 43, 600)]
+        assert sender.session_startup_pending is False
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_sender_tick_emits_heartbeat_on_stable_cycle(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    tick_module = sys.modules["Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_tick_runtime"]
+    sender_module = sys.modules[module.DropTrackerSender.__module__]
+    sender = module.DropTrackerSender()
+    sender.last_seen_map_id = 156
+    sender.last_seen_instance_uptime_ms = 5000
+    sender.last_inventory_snapshot = {(1, 1): ("Old Item", "White", 1, 500, 42)}
+    sender.last_heartbeat_log_at = 0.0
+    sender.heartbeat_interval_s = 0.0
+
+    logged_events: list[str] = []
+
+    monkeypatch.setattr(tick_module, "read_current_map_instance", lambda: (156, 8000))
+    monkeypatch.setattr(sender_module, "read_current_map_instance", lambda: (156, 8000), raising=False)
+    monkeypatch.setattr(tick_module, "classify_map_instance_transition", lambda **_kwargs: "")
+    monkeypatch.setattr(sender_module, "classify_map_instance_transition", lambda **_kwargs: "", raising=False)
+    monkeypatch.setattr(tick_module.Routines.Checks.Map, "MapValid", lambda: True)
+    monkeypatch.setattr(
+        sender,
+        "_append_live_debug_log",
+        lambda event, *_args, **_kwargs: logged_events.append(str(event or "").strip()),
+    )
+    monkeypatch.setattr(sender, "_load_runtime_config", lambda: None)
+    monkeypatch.setattr(sender, "_poll_world_item_disappearances", lambda: None)
+    monkeypatch.setattr(sender, "_process_inventory_deltas", lambda: None)
+    monkeypatch.setattr(sender, "_flush_outbox", lambda: 0)
+    monkeypatch.setattr(sender, "_process_pending_name_refreshes", lambda: None)
+    sender.config_poll_timer.Reset()
+    sender.inventory_poll_timer.Reset()
+    sender.world_item_poll_timer.Reset()
+
+    try:
+        tick_module.run_sender_tick(sender)
+        assert "sender_runtime_heartbeat" in logged_events
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_drop_tracker_sender_reentrant_init_preserves_tracking_state(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender = module.DropTrackerSender()
+    sender.last_inventory_snapshot = {(1, 1): ("Longbow", "White", 1, 137, 123)}
+    sender.pending_slot_deltas = {(1, 2): {"qty": 1, "model_id": 282, "item_id": 456, "rarity": "Gold"}}
+    sender.carryover_inventory_snapshot = {(0, -1): ("Earth Staff", "Gold", 1, 274, 0)}
+    sender.session_startup_pending = True
+    sender.is_warmed_up = True
+    sender.stable_snapshot_count = 2
+    original_inventory_poll_timer = sender.inventory_poll_timer
+    original_world_item_poll_timer = sender.world_item_poll_timer
+
+    sender_reentrant = module.DropTrackerSender()
+
+    try:
+        assert sender_reentrant is sender
+        assert sender.last_inventory_snapshot == {(1, 1): ("Longbow", "White", 1, 137, 123)}
+        assert (1, 2) in sender.pending_slot_deltas
+        assert sender.carryover_inventory_snapshot == {(0, -1): ("Earth Staff", "Gold", 1, 274, 0)}
+        assert sender.session_startup_pending is True
+        assert sender.is_warmed_up is True
+        assert sender.stable_snapshot_count == 2
+        assert sender.inventory_poll_timer is original_inventory_poll_timer
+        assert sender.world_item_poll_timer is original_world_item_poll_timer
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -1547,6 +1973,14 @@ def test_sender_carryover_baseline_requires_world_confirmation_for_new_slot_afte
     sender.last_inventory_snapshot = dict(old_snapshot)
     sender.is_warmed_up = True
     sender.pending_slot_deltas = {}
+    sender.carryover_inventory_snapshot = {}
+    sender.carryover_suppression_until = 0.0
+    sender.session_startup_pending = False
+    sender.stable_snapshot_count = 0
+    sender.last_reset_reason = ""
+    sender.last_reset_map_id = 0
+    sender.last_reset_instance_uptime_ms = 0
+    sender.last_reset_started_at = 0.0
 
     queued_events: list[tuple[str, int, str, int, int]] = []
     snapshots = [
@@ -1622,6 +2056,14 @@ def test_sender_carryover_baseline_ignores_existing_inventory_when_names_unresol
     sender.last_inventory_snapshot = dict(old_snapshot)
     sender.is_warmed_up = True
     sender.pending_slot_deltas = {}
+    sender.carryover_inventory_snapshot = {}
+    sender.carryover_suppression_until = 0.0
+    sender.session_startup_pending = False
+    sender.stable_snapshot_count = 0
+    sender.last_reset_reason = ""
+    sender.last_reset_map_id = 0
+    sender.last_reset_instance_uptime_ms = 0
+    sender.last_reset_started_at = 0.0
 
     queued_events: list[tuple[str, int, str, int, int]] = []
     snapshots = [
@@ -1652,12 +2094,12 @@ def test_sender_carryover_baseline_ignores_existing_inventory_when_names_unresol
 
         sender._process_inventory_deltas()
         assert queued_events == []
-        assert sender.session_startup_pending is True
-
-        sender._process_inventory_deltas()
         assert queued_events == []
         assert sender.pending_slot_deltas == {}
         assert sender.session_startup_pending is False
+
+        sender._process_inventory_deltas()
+        assert queued_events == []
 
         sender._process_inventory_deltas()
         assert queued_events == []
@@ -1940,6 +2382,69 @@ def test_sender_duplicate_map_change_reset_is_coalesced(monkeypatch):
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_sender_duplicate_instance_change_reset_is_coalesced_in_low_uptime_window(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender = module.DropTrackerSender()
+    original_snapshot = {
+        (1, 1): ("Old Item", "White", 1, 500, 42),
+    }
+    sender.last_inventory_snapshot = dict(original_snapshot)
+    sender.is_warmed_up = True
+
+    try:
+        sender._begin_new_session("instance_change", 14, 1800)
+        first_session_id = int(sender.sender_session_id)
+        first_carryover = dict(sender.carryover_inventory_snapshot)
+        sender.last_reset_started_at = time.time() - 6.0
+
+        sender.last_inventory_snapshot = {(1, 2): ("New Snapshot", "Blue", 1, 600, 43)}
+        sender._begin_new_session("instance_change", 14, 3300)
+
+        assert int(sender.sender_session_id) == first_session_id
+        assert sender.carryover_inventory_snapshot == first_carryover
+        assert sender.last_seen_map_id == 14
+        assert sender.last_seen_instance_uptime_ms == 3300
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_sender_viewer_sync_reset_is_coalesced_with_followup_instance_change(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender = module.DropTrackerSender()
+    sender.carryover_inventory_snapshot = {}
+    sender.carryover_suppression_until = 0.0
+    sender.last_reset_reason = ""
+    sender.last_reset_map_id = 0
+    sender.last_reset_instance_uptime_ms = 0
+    sender.last_reset_started_at = 0.0
+    sender.last_seen_map_id = 0
+    sender.last_seen_instance_uptime_ms = 0
+    original_snapshot = {
+        (1, 1): ("Old Item", "White", 1, 500, 42),
+    }
+    sender.last_inventory_snapshot = dict(original_snapshot)
+    sender.is_warmed_up = True
+
+    try:
+        sender._begin_new_session("viewer_sync_reset", 14, 1700)
+        first_session_id = int(sender.sender_session_id)
+        first_carryover = dict(sender.carryover_inventory_snapshot)
+        sender.last_reset_started_at = time.time() - 5.5
+
+        sender.last_inventory_snapshot = {(1, 2): ("New Snapshot", "Blue", 1, 600, 43)}
+        sender._begin_new_session("instance_change", 14, 3200)
+
+        assert int(sender.sender_session_id) == first_session_id
+        assert sender.carryover_inventory_snapshot == first_carryover
+        assert sender.last_seen_map_id == 14
+        assert sender.last_seen_instance_uptime_ms == 3200
+        assert sender.last_reset_reason == "instance_change"
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_sender_begin_new_session_clears_stale_outbox_and_name_refreshes(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
@@ -1993,6 +2498,41 @@ def test_sender_begin_new_session_clears_stale_outbox_and_name_refreshes(monkeyp
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_sender_session_reset_log_includes_reset_origin_metadata(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    sender = module.DropTrackerSender()
+    sender.carryover_inventory_snapshot = {}
+    sender.carryover_suppression_until = 0.0
+    sender.last_reset_reason = ""
+    sender.last_reset_map_id = 0
+    sender.last_reset_instance_uptime_ms = 0
+    sender.last_reset_started_at = 0.0
+    sender.last_seen_map_id = 0
+    sender.last_seen_instance_uptime_ms = 0
+    sender.pending_reset_origin = "viewer_sync_reset"
+    sender.pending_reset_source_runtime_id = "viewer-g9-i2-p123"
+    sender.pending_reset_source_caller = "draw_window"
+    sender.pending_reset_source_sequence = 42
+    sender.last_inventory_snapshot = {(1, 1): ("Old Item", "White", 1, 500, 42)}
+    sender.is_warmed_up = True
+    logged: list[dict] = []
+    sender._append_live_debug_log = lambda event, message, **fields: logged.append(
+        {"event": event, "message": message, **fields}
+    )
+
+    try:
+        sender._begin_new_session("viewer_sync_reset", 14, 1700)
+        assert logged
+        assert logged[0]["event"] == "sender_session_reset"
+        assert logged[0]["reset_origin"] == "viewer_sync_reset"
+        assert logged[0]["reset_source_runtime_id"] == "viewer-g9-i2-p123"
+        assert logged[0]["reset_source_caller"] == "draw_window"
+        assert int(logged[0]["reset_source_sequence"]) == 42
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_viewer_duplicate_instance_reset_is_coalesced(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
@@ -2012,6 +2552,79 @@ def test_viewer_duplicate_instance_reset_is_coalesced(monkeypatch):
         assert coalesced is True
         assert viewer.last_seen_map_id == 27
         assert viewer.last_seen_instance_uptime_ms == 1200
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_viewer_duplicate_instance_reset_is_coalesced_across_low_uptime_window(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    runtime_update_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_runtime_update"
+    )
+    viewer = module.DropViewerWindow()
+    viewer.last_reset_reason = "viewer_instance_reset"
+    viewer.last_reset_map_id = 27
+    viewer.last_reset_instance_uptime_ms = 1800
+    viewer.last_reset_started_at = time.time() - 6.0
+    viewer.last_seen_map_id = 27
+    viewer.last_seen_instance_uptime_ms = 1800
+
+    try:
+        coalesced = runtime_update_module._should_coalesce_viewer_reset(viewer, "viewer_instance_reset", 27, 3300)
+        assert coalesced is True
+        assert viewer.last_seen_map_id == 27
+        assert viewer.last_seen_instance_uptime_ms == 3300
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_viewer_cross_reason_low_uptime_reset_is_not_coalesced(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    runtime_update_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_runtime_update"
+    )
+    viewer = module.DropViewerWindow()
+    viewer.last_reset_reason = "viewer_sync_reset"
+    viewer.last_reset_map_id = 27
+    viewer.last_reset_instance_uptime_ms = 1700
+    viewer.last_reset_started_at = time.time() - 5.5
+    viewer.last_seen_map_id = 27
+    viewer.last_seen_instance_uptime_ms = 1700
+
+    try:
+        coalesced = runtime_update_module._should_coalesce_viewer_reset(viewer, "viewer_instance_reset", 27, 3200)
+        assert coalesced is False
+        assert viewer.last_reset_map_id == 27
+        assert viewer.last_reset_instance_uptime_ms == 3200
+        assert viewer.last_reset_reason == "viewer_instance_reset"
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_viewer_session_reset_log_includes_runtime_identity(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    logged: list[dict] = []
+    viewer.last_update_caller = "draw_window"
+    viewer.last_update_sequence = 14
+    viewer.last_update_started_at = 123.5
+    monkeypatch.setattr(module, "append_live_debug_log", lambda **payload: logged.append(dict(payload)))
+    viewer._reset_sender_tracking_session = lambda current_map_id=0, current_instance_uptime_ms=0: None
+    viewer._reset_live_session = lambda preserve_live_log=False: None
+    viewer._flush_pending_tracker_messages = lambda: 0
+    viewer._drain_pending_tracker_messages = lambda max_passes=6: 0
+    monkeypatch.setattr(module.Player, "IsChatHistoryReady", staticmethod(lambda: False), raising=False)
+
+    try:
+        viewer._begin_new_explorable_session("viewer_instance_reset", 54, 1800)
+        assert logged
+        assert logged[0]["event"] == "viewer_session_reset"
+        assert logged[0]["viewer_runtime_id"] == viewer.viewer_runtime_id
+        assert logged[0]["update_caller"] == "draw_window"
+        assert int(logged[0]["update_sequence"]) == 14
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -2165,6 +2778,46 @@ def test_viewer_row_updates_persist_late_name_and_stats_to_log_file(monkeypatch)
         assert len(parsed) == 1
         assert parsed[0].item_name == "Furious War Axe of Warding"
         assert parsed[0].item_stats == "Furious War Axe of Warding\nDamage: 6-28"
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_set_row_item_stats_skips_persist_when_stats_unchanged(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    row_updates_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_row_updates"
+    )
+    viewer = module.DropViewerWindow()
+    persist_calls: list[str] = []
+    monkeypatch.setattr(
+        row_updates_module,
+        "persist_runtime_row_to_file",
+        lambda _viewer, _row: persist_calls.append("persist"),
+    )
+    row = [
+        "2026-03-04 18:50:00",
+        "Viewer",
+        "54",
+        "Scoundrel's Rise",
+        "Player Three",
+        "War Axe",
+        "1",
+        "Gold",
+        "ev-persist",
+        "War Axe\nDamage: 6-28",
+        "42",
+        "sender@test",
+    ]
+
+    try:
+        row_updates_module.set_row_item_stats(
+            viewer,
+            row,
+            "War Axe\nDamage: 6-28",
+        )
+        assert persist_calls == []
+        assert row[9] == "War Axe\nDamage: 6-28"
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -2909,6 +3562,38 @@ def test_stats_mismatch_log_ignores_rune_first_line_subset_of_full_row_name(monk
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
+def test_stats_mismatch_log_ignores_later_rendered_line_matching_row_name(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    stats_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_shmem_names_stats"
+    )
+    viewer = module.DropViewerWindow()
+    emitted: list[dict[str, object]] = []
+    viewer._append_live_debug_log = lambda event, message, **fields: emitted.append(
+        {"event": event, "message": message, **fields}
+    )
+    try:
+        stats_module._append_stats_name_mismatch_debug_log(
+            viewer,
+            event_id="ev-render-match",
+            sender_email="sender@test",
+            player_name="Player Five",
+            row_names=["Bloodstained Dwarven Sage Outfit of Superior Beast Mastery"],
+            payload_name="",
+            first_line_name="Ranger Rune of Superior Beast Mastery",
+            rendered_head=(
+                "Ranger Rune of Superior Beast Mastery\n"
+                "Bloodstained Dwarven Sage Outfit of Superior Beast Mastery\n"
+                "+3 BeastMastery (Non-stacking)"
+            ),
+            update_source="text",
+        )
+        assert emitted == []
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_stats_mismatch_log_ignores_joined_preposition_spacing_variant(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
@@ -2992,6 +3677,37 @@ def test_selected_stats_name_mismatch_log_ignores_matching_row_name(monkeypatch)
             stats_text="Frigid Heart of Endurance\nArmor: 16 (vs 8)",
         )
         assert emitted == []
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_selected_stats_name_mismatch_log_ignores_later_matching_row_name(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    panels_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_draw_panels"
+    )
+    viewer = module.DropViewerWindow()
+    emitted: list[dict[str, object]] = []
+    viewer._append_live_debug_log = lambda event, message, **fields: emitted.append(
+        {"event": event, "message": message, **fields}
+    )
+    try:
+        panels_module._append_selected_stats_name_mismatch_debug_log(
+            viewer,
+            event_id="ev-ui-render-match",
+            sender_email="sender@test",
+            player_name="Player One",
+            selected_item_name="Bloodstained Dwarven Sage Outfit of Superior Beast Mastery",
+            row_item_name="Bloodstained Dwarven Sage Outfit of Superior Beast Mastery",
+            stats_text=(
+                "Ranger Rune of Superior Beast Mastery\n"
+                "Bloodstained Dwarven Sage Outfit of Superior Beast Mastery\n"
+                "+3 BeastMastery (Non-stacking)"
+            ),
+        )
+        assert emitted == []
+        assert viewer.selected_name_mismatch_popup_pending is False
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -3158,6 +3874,26 @@ def test_auto_buy_kits_rejected_outside_outpost(monkeypatch):
     try:
         monkeypatch.setattr(module.Map, "IsOutpost", staticmethod(lambda: False), raising=False)
         assert viewer._is_auto_buy_kits_allowed_outpost() is False
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_drop_viewer_merchant_runtime_wrappers_are_bound(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    viewer = module.DropViewerWindow()
+    try:
+        monkeypatch.setattr(module, "get_nearby_merchant_candidate_agent_ids", lambda _viewer: [42, 77], raising=False)
+        monkeypatch.setattr(module, "find_nearby_merchant_agent_id", lambda _viewer: 42, raising=False)
+        monkeypatch.setattr(module, "is_merchant_frame_open", lambda _viewer: True, raising=False)
+        monkeypatch.setattr(module, "handle_lions_arch_merchant_dialog_if_visible", lambda _viewer: True, raising=False)
+        monkeypatch.setattr(module, "get_offered_merchant_items", lambda _viewer: [9001], raising=False)
+
+        assert viewer._get_nearby_merchant_candidate_agent_ids() == [42, 77]
+        assert viewer._find_nearby_merchant_agent_id() == 42
+        assert viewer._is_merchant_frame_open() is True
+        assert viewer._handle_lions_arch_merchant_dialog_if_visible() is True
+        assert viewer._get_offered_merchant_items() == [9001]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -3361,7 +4097,7 @@ def test_sender_suppresses_utility_kit_fallback_when_world_candidates_are_empty(
         shutil.rmtree(tmp_path, ignore_errors=True)
 
 
-def test_sender_does_not_fallback_accept_slot_replaced_when_world_candidates_are_empty(monkeypatch):
+def test_sender_fallback_accepts_slot_replaced_when_world_candidates_are_empty(monkeypatch):
     tmp_path = _make_local_tmp_dir()
     module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
     sender = module.DropTrackerSender()
@@ -3396,7 +4132,8 @@ def test_sender_does_not_fallback_accept_slot_replaced_when_world_candidates_are
 
     try:
         sender._process_inventory_deltas()
-        assert queued_events == []
+        assert len(queued_events) == 1
+        assert queued_events[0] == ("Zaishen Summoning Stones", 20, "White", 2002, 31154)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -5861,9 +6598,65 @@ def test_reset_live_session_can_preserve_live_log_file(monkeypatch):
         parsed = log_store_module.parse_drop_log_file(viewer.log_path)
         assert len(parsed) == 1
         assert parsed[0].event_id == "ev-preserve"
+        assert viewer.live_session_log_floor_row_count == 1
         assert viewer.raw_drops == []
         assert viewer.total_drops == 0
         assert viewer.last_read_time == os.path.getmtime(viewer.log_path)
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_parse_log_file_ignores_preserved_rows_before_live_session_floor(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    log_store_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_log_store"
+    )
+    model_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_models"
+    )
+    viewer = module.DropViewerWindow()
+    preserved_row = [
+        "2026-03-06 02:48:25",
+        "Viewer",
+        "92",
+        "Tasca's Demise",
+        "Player Two",
+        "Earth Staff",
+        "1",
+        "Purple",
+        "ev-preserve",
+        "Unidentified",
+        "431",
+        "sender@test",
+    ]
+    new_row = [
+        "2026-03-06 02:49:40",
+        "Viewer",
+        "92",
+        "Tasca's Demise",
+        "Player Two",
+        "Water Wand",
+        "1",
+        "Gold",
+        "ev-new",
+        "Water Wand\nValue: 240 gold",
+        "432",
+        "sender@test",
+    ]
+    preserved_model = model_module.DropLogRow.from_runtime_row(preserved_row)
+    new_model = model_module.DropLogRow.from_runtime_row(new_row)
+    assert preserved_model is not None
+    assert new_model is not None
+    log_store_module.append_drop_log_rows(viewer.log_path, [preserved_model])
+
+    try:
+        viewer._reset_live_session(preserve_live_log=True)
+        log_store_module.append_drop_log_rows(viewer.log_path, [new_model])
+        viewer._parse_log_file(viewer.log_path)
+        assert len(viewer.raw_drops) == 1
+        assert viewer.raw_drops[0][8] == "ev-new"
+        assert viewer.total_drops == 1
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
@@ -5892,6 +6685,8 @@ def test_viewer_duplicate_same_map_session_reset_preserves_existing_rows(monkeyp
     viewer.total_drops = 1
     viewer.last_session_reset_map_id = 54
     viewer.last_session_reset_started_at = time.time()
+    viewer.last_session_reset_reason = "viewer_instance_reset"
+    viewer.last_session_reset_instance_uptime_ms = 4800
     reset_sender_calls: list[tuple[int, int]] = []
     reset_live_calls: list[str] = []
     flushed_calls: list[str] = []
@@ -5923,6 +6718,141 @@ def test_viewer_duplicate_same_map_session_reset_preserves_existing_rows(monkeyp
         assert viewer.raw_drops[0][5] == "Truncheon"
         assert statuses == ["Auto reset on map change"]
         assert any("RESET TRACE preserved" in line for line in reset_logs)
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_viewer_same_map_reset_not_coalesced_when_uptime_diverges(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    session_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_session_runtime"
+    )
+    viewer = module.DropViewerWindow()
+    viewer.raw_drops = [[
+        "2026-03-04 18:58:00",
+        "Viewer",
+        "54",
+        "Scoundrel's Rise",
+        "Player Five",
+        "Truncheon",
+        "1",
+        "Purple",
+        "ev-keep",
+        "",
+        "101",
+        "sender@test",
+    ]]
+    viewer.total_drops = 1
+    viewer.last_session_reset_map_id = 54
+    viewer.last_session_reset_started_at = time.time()
+    viewer.last_session_reset_reason = "viewer_instance_reset"
+    viewer.last_session_reset_instance_uptime_ms = 5000
+    reset_sender_calls: list[tuple[int, int]] = []
+    reset_live_calls: list[str] = []
+    flushed_calls: list[str] = []
+    statuses: list[str] = []
+    reset_logs: list[str] = []
+    viewer._drain_pending_tracker_messages = lambda max_passes=6: 0
+    viewer._reset_sender_tracking_session = lambda current_map_id=0, current_instance_uptime_ms=0: reset_sender_calls.append(
+        (int(current_map_id), int(current_instance_uptime_ms))
+    )
+    viewer._reset_live_session = lambda preserve_live_log=False: reset_live_calls.append(
+        f"reset:{int(bool(preserve_live_log))}"
+    )
+    viewer._flush_pending_tracker_messages = lambda: flushed_calls.append("flush") or 0
+    viewer._log_reset_trace = lambda message, consume=False: reset_logs.append(str(message))
+    viewer.set_status = lambda message: statuses.append(str(message))
+
+    monkeypatch.setattr(module.time, "time", lambda: viewer.last_session_reset_started_at + 1.5, raising=False)
+    monkeypatch.setattr(module.Player, "IsChatHistoryReady", staticmethod(lambda: False), raising=False)
+
+    try:
+        session_module.begin_new_explorable_session(
+            viewer,
+            "viewer_instance_reset",
+            54,
+            300,
+            "Auto reset on map change",
+        )
+        assert reset_sender_calls == [(54, 300)]
+        assert reset_live_calls == ["reset:1"]
+        assert flushed_calls == ["flush"]
+        assert statuses == ["Auto reset on map change"]
+        assert not any("RESET TRACE preserved" in line for line in reset_logs)
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_viewer_init_preserves_existing_live_log_rows(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    log_store_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_log_store"
+    )
+    model_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_models"
+    )
+    viewer = module.DropViewerWindow()
+    viewer.raw_drops = [[
+        "2026-03-07 17:19:58",
+        "Leader",
+        "93",
+        "Spearhead Peak",
+        "Mesmer Tri",
+        "Dwarven Warrior Armor",
+        "1",
+        "Blue",
+        "ev-old",
+        "",
+        "484",
+        "peer@test",
+    ]]
+    original_row = model_module.DropLogRow.from_runtime_row(viewer.raw_drops[0])
+    assert original_row is not None
+    log_store_module.append_drop_log_rows(viewer.log_path, [original_row])
+
+    try:
+        reopened = module.DropViewerWindow()
+        parsed_rows = log_store_module.parse_drop_log_file(reopened.log_path)
+        assert len(parsed_rows) == 1
+        assert parsed_rows[0].event_id == "ev-old"
+        assert reopened.raw_drops == []
+        assert reopened.total_drops == 0
+        assert int(reopened.live_session_log_floor_row_count) == 1
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def test_viewer_session_reset_drains_tracker_messages_before_reset(monkeypatch):
+    tmp_path = _make_local_tmp_dir()
+    module, _py4gw_mod = _import_start_drop_viewer(monkeypatch, tmp_path)
+    session_module = importlib.import_module(
+        "Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_session_runtime"
+    )
+    viewer = module.DropViewerWindow()
+    calls: list[str] = []
+    statuses: list[str] = []
+
+    viewer._drain_pending_tracker_messages = lambda max_passes=6: calls.append("drain") or 2
+    viewer._reset_sender_tracking_session = lambda current_map_id=0, current_instance_uptime_ms=0: calls.append("reset_sender")
+    viewer._reset_live_session = lambda preserve_live_log=False: calls.append(f"reset_live:{int(bool(preserve_live_log))}")
+    viewer._flush_pending_tracker_messages = lambda: calls.append("flush") or 0
+    viewer._log_reset_trace = lambda message, consume=False: calls.append("trace")
+    viewer.set_status = lambda message: statuses.append(str(message))
+
+    monkeypatch.setattr(module.Player, "IsChatHistoryReady", staticmethod(lambda: False), raising=False)
+
+    try:
+        session_module.begin_new_explorable_session(
+            viewer,
+            "viewer_instance_reset",
+            54,
+            5000,
+            "Auto reset on map change",
+        )
+        assert calls == ["trace", "drain", "trace", "reset_sender", "reset_live:1", "flush"]
+        assert statuses == ["Auto reset on map change"]
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 

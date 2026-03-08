@@ -1,6 +1,9 @@
 import sys
 import time
 
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_alerts import (
+    trigger_selected_name_mismatch_alert,
+)
 
 EXPECTED_RUNTIME_ERRORS = (TypeError, ValueError, RuntimeError, AttributeError, IndexError, KeyError, OSError)
 
@@ -41,6 +44,37 @@ def _compact_item_name_key(viewer, value: str) -> str:
     if not clean_value:
         return ""
     return "".join(ch for ch in clean_value if ch.isalnum())
+
+
+def _rendered_stats_lines_match_names(viewer, stats_text: str, candidate_names: list[str]) -> bool:
+    normalized_names = {
+        viewer._normalize_item_name(viewer._clean_item_name(value).strip())
+        for value in list(candidate_names or [])
+        if viewer._clean_item_name(value).strip()
+    }
+    normalized_names.discard("")
+    compact_names = {
+        _compact_item_name_key(viewer, viewer._clean_item_name(value).strip())
+        for value in list(candidate_names or [])
+        if viewer._clean_item_name(value).strip()
+    }
+    compact_names.discard("")
+    if not normalized_names and not compact_names:
+        return False
+    for raw_line in viewer._ensure_text(stats_text).splitlines():
+        line_txt = viewer._clean_item_name(raw_line).strip()
+        if not line_txt or line_txt.lower() == "unidentified":
+            continue
+        normalized_line = viewer._normalize_item_name(line_txt)
+        if normalized_line and normalized_line in normalized_names:
+            return True
+        compact_line = _compact_item_name_key(viewer, line_txt)
+        if compact_line and any(
+            compact_line == candidate or compact_line in candidate or candidate in compact_line
+            for candidate in compact_names
+        ):
+            return True
+    return False
 
 
 def _append_selected_stats_name_mismatch_debug_log(
@@ -89,6 +123,8 @@ def _append_selected_stats_name_mismatch_debug_log(
         for candidate in compact_names
     ):
         return
+    if _rendered_stats_lines_match_names(viewer, stats_text, [clean_row_name, clean_selected_name]):
+        return
 
     event_key = viewer._ensure_text(event_id).strip()
     sender_key = viewer._ensure_text(sender_email).strip().lower()
@@ -107,15 +143,266 @@ def _append_selected_stats_name_mismatch_debug_log(
         ),
         dedupe_interval_s=1.5,
     )
-    viewer.selected_name_mismatch_popup_message = (
-        f"Selected item mismatch\n"
-        f"Player: {viewer._ensure_text(player_name).strip() or 'Unknown'}\n"
-        f"Selected: {clean_selected_name or '-'}\n"
-        f"Row: {clean_row_name or '-'}\n"
-        f"Stats: {first_line or '-'}"
+    trigger_selected_name_mismatch_alert(
+        viewer,
+        player_name=viewer._ensure_text(player_name).strip(),
+        selected_item_name=clean_selected_name,
+        row_item_name=clean_row_name,
+        stats_first_line=first_line,
+        duration_s=5.0,
     )
-    viewer.selected_name_mismatch_popup_until = time.time() + 5.0
-    viewer.selected_name_mismatch_popup_pending = True
+
+
+def _row_stats_cache_entry_key(viewer, row) -> tuple:
+    if row is None:
+        return ()
+    try:
+        event_id = viewer._ensure_text(viewer._extract_row_event_id(row)).strip()
+    except EXPECTED_RUNTIME_ERRORS:
+        event_id = ""
+    try:
+        sender_email = viewer._ensure_text(viewer._extract_row_sender_email(row)).strip().lower()
+    except EXPECTED_RUNTIME_ERRORS:
+        sender_email = ""
+    try:
+        item_id = max(0, int(viewer._extract_row_item_id(row)))
+    except EXPECTED_RUNTIME_ERRORS:
+        item_id = 0
+    try:
+        row_stats = viewer._ensure_text(viewer._extract_row_item_stats(row)).strip()
+    except EXPECTED_RUNTIME_ERRORS:
+        row_stats = ""
+    try:
+        parsed = viewer._parse_drop_row(row)
+    except EXPECTED_RUNTIME_ERRORS:
+        parsed = None
+    row_item_name = ""
+    if parsed is not None:
+        try:
+            row_item_name = viewer._clean_item_name(getattr(parsed, "item_name", ""))
+        except EXPECTED_RUNTIME_ERRORS:
+            row_item_name = ""
+    return (
+        id(row),
+        event_id,
+        sender_email,
+        item_id,
+        row_item_name,
+    )
+
+
+def _get_row_stats_text_cached(viewer, row, scope: str, refresh_interval_s: float = 0.35) -> str:
+    if row is None:
+        return ""
+    try:
+        now_ts = float(time.time())
+    except EXPECTED_RUNTIME_ERRORS:
+        now_ts = 0.0
+    try:
+        refresh_interval = max(0.05, float(refresh_interval_s))
+    except EXPECTED_RUNTIME_ERRORS:
+        refresh_interval = 0.35
+
+    cache_map = getattr(viewer, "_ui_row_stats_cache", None)
+    if not isinstance(cache_map, dict):
+        cache_map = {}
+        setattr(viewer, "_ui_row_stats_cache", cache_map)
+
+    scope_key = viewer._ensure_text(scope).strip() or "default"
+    row_key = _row_stats_cache_entry_key(viewer, row)
+    cached_entry = cache_map.get(scope_key)
+    if isinstance(cached_entry, dict):
+        cached_key = cached_entry.get("key")
+        try:
+            cached_ts = float(cached_entry.get("ts", 0.0) or 0.0)
+        except EXPECTED_RUNTIME_ERRORS:
+            cached_ts = 0.0
+        if cached_key == row_key and (now_ts - cached_ts) < refresh_interval:
+            return viewer._ensure_text(cached_entry.get("text", "")).strip()
+
+    stats_text = viewer._ensure_text(viewer._get_row_stats_text(row)).strip()
+    cache_map[scope_key] = {
+        "key": row_key,
+        "text": stats_text,
+        "ts": now_ts,
+    }
+    return stats_text
+
+
+def _get_row_preview_stats_text_fast(viewer, row) -> str:
+    if row is None:
+        return ""
+    direct_text = viewer._ensure_text(viewer._extract_row_item_stats(row)).strip()
+    if direct_text:
+        return direct_text
+
+    event_cache_key = viewer._resolve_stats_cache_key_for_row(row)
+    if event_cache_key:
+        cached_state = viewer._ensure_text(viewer._get_event_state_stats_text(event_cache_key)).strip()
+        if cached_state:
+            return cached_state
+
+        payload_text = viewer._ensure_text(viewer._get_event_state_payload_text(event_cache_key)).strip()
+        if not payload_text:
+            payload_text = viewer._ensure_text(
+                viewer._get_cached_stats_text(viewer.stats_payload_by_event, event_cache_key)
+            ).strip()
+        if payload_text:
+            parsed = viewer._parse_drop_row(row)
+            fallback_name = viewer._ensure_text(getattr(parsed, "item_name", "") if parsed is not None else "").strip()
+            owner_name = viewer._ensure_text(getattr(parsed, "player_name", "") if parsed is not None else "").strip()
+            rendered = viewer._ensure_text(
+                viewer._render_payload_stats_cached(
+                    event_cache_key,
+                    payload_text,
+                    fallback_name,
+                    owner_name=owner_name,
+                )
+            ).strip()
+            if rendered:
+                return rendered
+
+        cached_text = viewer._ensure_text(
+            viewer._get_cached_stats_text(viewer.stats_by_event, event_cache_key)
+        ).strip()
+        if cached_text:
+            return cached_text
+
+    viewer._request_remote_stats_for_row(row, force_refresh=False)
+    return ""
+
+
+def _get_row_preview_stats_text_cached(viewer, row, scope: str, refresh_interval_s: float = 0.35) -> str:
+    if row is None:
+        return ""
+    try:
+        now_ts = float(time.time())
+    except EXPECTED_RUNTIME_ERRORS:
+        now_ts = 0.0
+    try:
+        refresh_interval = max(0.05, float(refresh_interval_s))
+    except EXPECTED_RUNTIME_ERRORS:
+        refresh_interval = 0.35
+
+    cache_map = getattr(viewer, "_ui_row_stats_cache", None)
+    if not isinstance(cache_map, dict):
+        cache_map = {}
+        setattr(viewer, "_ui_row_stats_cache", cache_map)
+
+    scope_key = f"preview:{viewer._ensure_text(scope).strip() or 'default'}"
+    row_key = _row_stats_cache_entry_key(viewer, row)
+    cached_entry = cache_map.get(scope_key)
+    if isinstance(cached_entry, dict):
+        cached_key = cached_entry.get("key")
+        try:
+            cached_ts = float(cached_entry.get("ts", 0.0) or 0.0)
+        except EXPECTED_RUNTIME_ERRORS:
+            cached_ts = 0.0
+        if cached_key == row_key and (now_ts - cached_ts) < refresh_interval:
+            return viewer._ensure_text(cached_entry.get("text", "")).strip()
+
+    stats_text = viewer._ensure_text(_get_row_preview_stats_text_fast(viewer, row)).strip()
+    cache_map[scope_key] = {
+        "key": row_key,
+        "text": stats_text,
+        "ts": now_ts,
+    }
+    return stats_text
+
+
+def _collect_selected_item_stats_cached(viewer, item_key, scope: str, refresh_interval_s: float = 0.25):
+    if not item_key:
+        return None
+
+    cache_map = getattr(viewer, "_ui_selected_item_stats_cache", None)
+    if not isinstance(cache_map, dict):
+        cache_map = {}
+        setattr(viewer, "_ui_selected_item_stats_cache", cache_map)
+
+    scope_key = viewer._ensure_text(scope).strip() or "default"
+    scope_bucket = cache_map.get(scope_key)
+    if not isinstance(scope_bucket, dict):
+        scope_bucket = {}
+        cache_map[scope_key] = scope_bucket
+    try:
+        rows_version = max(0, int(getattr(viewer, "_runtime_rows_version", 0) or 0))
+    except EXPECTED_RUNTIME_ERRORS:
+        rows_version = 0
+    cache_key = (item_key, rows_version)
+    cached_entry = scope_bucket.get(cache_key)
+    if isinstance(cached_entry, dict):
+        return cached_entry.get("stats")
+
+    stats = viewer._collect_selected_item_stats(item_key)
+    if len(scope_bucket) > 120:
+        keep_keys = [
+            key
+            for key in list(scope_bucket.keys())
+            if isinstance(key, tuple) and len(key) >= 2 and int(key[1]) == rows_version
+        ]
+        next_bucket = {key: scope_bucket[key] for key in keep_keys}
+        scope_bucket.clear()
+        scope_bucket.update(next_bucket)
+    scope_bucket[cache_key] = {
+        "stats": stats,
+    }
+    return stats
+
+
+def _get_selected_item_rows_cached(viewer, item_key, rows=None):
+    if not item_key:
+        return []
+    pool = rows if rows is not None else getattr(viewer, "raw_drops", [])
+    if not pool:
+        return []
+
+    cache_map = getattr(viewer, "_ui_selected_rows_cache", None)
+    if not isinstance(cache_map, dict):
+        cache_map = {}
+        setattr(viewer, "_ui_selected_rows_cache", cache_map)
+    try:
+        rows_version = max(0, int(getattr(viewer, "_runtime_rows_version", 0) or 0))
+    except EXPECTED_RUNTIME_ERRORS:
+        rows_version = 0
+    cache_key = (id(pool), item_key, rows_version)
+    cached_rows = cache_map.get(cache_key)
+    if isinstance(cached_rows, list):
+        return cached_rows
+
+    selected_rows = viewer._get_selected_item_rows(rows=pool, item_key=item_key)
+    if len(cache_map) > 48:
+        cache_map.clear()
+    cache_map[cache_key] = list(selected_rows or [])
+    return cache_map[cache_key]
+
+
+def _build_preview_item_stats_summary(viewer, active_log_row, active_item_key):
+    parsed = viewer._parse_drop_row(active_log_row)
+    if parsed is None:
+        return None
+    selected_name = ""
+    selected_rarity = ""
+    if isinstance(active_item_key, tuple) and len(active_item_key) >= 2:
+        selected_name = viewer._ensure_text(active_item_key[0]).strip()
+        selected_rarity = viewer._ensure_text(active_item_key[1]).strip()
+    row_rarity = viewer._ensure_text(parsed.rarity).strip() or "Unknown"
+    item_name = selected_name or viewer._ensure_text(parsed.item_name).strip() or "Unknown Item"
+    item_rarity = selected_rarity or row_rarity
+    try:
+        quantity = max(1, int(parsed.quantity))
+    except EXPECTED_RUNTIME_ERRORS:
+        quantity = 1
+    character_name = viewer._display_player_name(
+        viewer._ensure_text(parsed.player_name).strip(),
+        viewer._extract_row_sender_email(active_log_row),
+    ).strip() or "Unknown"
+    return {
+        "name": item_name,
+        "rarity": item_rarity,
+        "quantity": int(quantity),
+        "count": 1,
+        "characters": [(character_name, {"Quantity": int(quantity), "Count": 1})],
+    }
 
 
 def draw_selected_item_details(viewer):
@@ -128,7 +415,22 @@ def draw_selected_item_details(viewer):
     active_log_row = preview_log_row if preview_log_row else viewer.selected_log_row
     preview_mode = bool(preview_item_key and preview_log_row)
 
-    stats = viewer._collect_selected_item_stats(active_item_key)
+    if preview_mode:
+        stats = _build_preview_item_stats_summary(viewer, active_log_row, active_item_key)
+    else:
+        stats = _collect_selected_item_stats_cached(
+            viewer,
+            active_item_key,
+            scope="selected_panel",
+            refresh_interval_s=0.25,
+        )
+    if not stats and preview_mode:
+        stats = _collect_selected_item_stats_cached(
+            viewer,
+            active_item_key,
+            scope="hover_preview",
+            refresh_interval_s=0.35,
+        )
     if not stats:
         return
 
@@ -143,8 +445,10 @@ def draw_selected_item_details(viewer):
     if preview_mode:
         pyimgui.text_colored("Previewing hovered row", (0.78, 0.78, 0.78, 1.0))
 
-    selected_rows = viewer._get_selected_item_rows(item_key=active_item_key)
-    if selected_rows and not preview_mode:
+    selected_rows = []
+    if not preview_mode:
+        selected_rows = _get_selected_item_rows_cached(viewer, active_item_key)
+    if selected_rows:
         selected_idx = viewer._get_selected_row_index(selected_rows)
         selected_idx = max(0, min(selected_idx, len(selected_rows) - 1))
         if viewer.selected_log_row is None or not viewer._row_matches_selected_item(viewer.selected_log_row):
@@ -182,7 +486,20 @@ def draw_selected_item_details(viewer):
         rarity_color = viewer._get_rarity_color(selected_rarity)
         pyimgui.text_colored(f"Selected Entry: {selected_char} | {selected_map} | {selected_ts}", rarity_color)
         pyimgui.text_colored(f"Selected Qty: {selected_qty}", rarity_color)
-        stats_text = viewer._get_row_stats_text(active_log_row)
+        if preview_mode:
+            stats_text = _get_row_preview_stats_text_cached(
+                viewer,
+                active_log_row,
+                scope="hover_preview",
+                refresh_interval_s=0.35,
+            )
+        else:
+            stats_text = _get_row_stats_text_cached(
+                viewer,
+                active_log_row,
+                scope="selected_panel",
+                refresh_interval_s=0.25,
+            )
         _append_selected_stats_name_mismatch_debug_log(
             viewer,
             event_id=viewer._extract_row_event_id(active_log_row),
@@ -639,23 +956,39 @@ def draw_metric_card(viewer, card_id, title, value, accent_color):
 
 def draw_summary_bar(viewer, filtered_rows):
     pyimgui = _runtime_attr(viewer, "PyImGui")
-    total_qty_without_gold = 0
-    rare_count = 0
-    gold_qty = 0
-    for row in filtered_rows:
-        parsed = viewer._parse_drop_row(row)
-        if parsed is None:
-            continue
-        qty = int(parsed.quantity)
-        rarity = viewer._ensure_text(parsed.rarity).strip() or "Unknown"
-        if viewer._is_rare_rarity(rarity):
-            rare_count += 1
-        if viewer._is_gold_row(row):
-            gold_qty += qty
-        elif rarity == "Material":
-            continue
-        else:
-            total_qty_without_gold += qty
+    summary_cache = getattr(viewer, "_cached_summary_metrics", None)
+    if not isinstance(summary_cache, dict):
+        summary_cache = {}
+        setattr(viewer, "_cached_summary_metrics", summary_cache)
+    try:
+        rows_version = max(0, int(getattr(viewer, "_runtime_rows_version", 0) or 0))
+    except EXPECTED_RUNTIME_ERRORS:
+        rows_version = 0
+    cache_key = (rows_version, id(filtered_rows), len(filtered_rows or []))
+    cached_key = summary_cache.get("key")
+    cached_values = summary_cache.get("values")
+    if cached_key == cache_key and isinstance(cached_values, tuple) and len(cached_values) == 3:
+        total_qty_without_gold, rare_count, gold_qty = cached_values
+    else:
+        filtered_agg, _total_qty = viewer._get_filtered_aggregated(filtered_rows)
+        total_qty_without_gold = 0
+        rare_count = 0
+        gold_qty = 0
+        for (item_name, rarity), data in list(filtered_agg.items()):
+            qty = max(0, int(data.get("Quantity", 0)))
+            event_count = max(0, int(data.get("Count", 0)))
+            clean_name = viewer._clean_item_name(item_name)
+            rarity_text = viewer._ensure_text(rarity).strip() or "Unknown"
+            if viewer._is_rare_rarity(rarity_text):
+                rare_count += event_count
+            if clean_name == "Gold":
+                gold_qty += qty
+            elif rarity_text == "Material":
+                continue
+            else:
+                total_qty_without_gold += qty
+        summary_cache["key"] = cache_key
+        summary_cache["values"] = (int(total_qty_without_gold), int(rare_count), int(gold_qty))
 
     session_time = viewer._get_session_duration_text()
     c = viewer._ui_colors()

@@ -4,6 +4,26 @@ from typing import Any
 
 
 EXPECTED_RUNTIME_ERRORS = (TypeError, ValueError, RuntimeError, AttributeError, IndexError, KeyError, OSError)
+RESET_COALESCE_WINDOW_S = 8.0
+LOW_UPTIME_RESET_MAX_MS = 5000
+
+
+def _is_low_uptime_duplicate_window(current_uptime: int, last_uptime: int) -> bool:
+    return (
+        current_uptime > 0
+        and last_uptime > 0
+        and current_uptime <= LOW_UPTIME_RESET_MAX_MS
+        and last_uptime <= LOW_UPTIME_RESET_MAX_MS
+    )
+
+
+def _is_same_stabilization_window(current_map: int, last_map: int, current_uptime: int, last_uptime: int, now_ts: float, last_started_at: float) -> bool:
+    return (
+        current_map > 0
+        and current_map == last_map
+        and (now_ts - last_started_at) <= RESET_COALESCE_WINDOW_S
+        and _is_low_uptime_duplicate_window(current_uptime, last_uptime)
+    )
 
 
 def _should_coalesce_viewer_reset(viewer, reason: str, current_map_id: int, current_instance_uptime_ms: int) -> bool:
@@ -15,17 +35,34 @@ def _should_coalesce_viewer_reset(viewer, reason: str, current_map_id: int, curr
     last_map = max(0, int(getattr(viewer, "last_reset_map_id", 0) or 0))
     last_uptime = max(0, int(getattr(viewer, "last_reset_instance_uptime_ms", 0) or 0))
     last_started_at = float(getattr(viewer, "last_reset_started_at", 0.0) or 0.0)
+    same_stabilization_window = _is_same_stabilization_window(
+        current_map,
+        last_map,
+        current_uptime,
+        last_uptime,
+        now_ts,
+        last_started_at,
+    )
+    same_reason = bool(reset_reason and last_reason and reset_reason == last_reason)
+    uptime_delta_ms = abs(current_uptime - last_uptime) if current_uptime > 0 and last_uptime > 0 else 0
+    same_reason_close_uptime = bool(same_reason and uptime_delta_ms <= 2500)
+    same_reason_stabilization_window = bool(
+        same_reason
+        and same_stabilization_window
+        and current_uptime >= last_uptime
+    )
     if (
-        reset_reason == last_reason
-        and current_map > 0
+        current_map > 0
         and current_map == last_map
-        and (now_ts - last_started_at) <= 3.5
+        and (now_ts - last_started_at) <= RESET_COALESCE_WINDOW_S
         and current_uptime > 0
         and last_uptime > 0
-        and abs(current_uptime - last_uptime) <= 2500
+        and (same_reason_close_uptime or same_reason_stabilization_window)
     ):
+        viewer.last_reset_reason = reset_reason
         viewer.last_seen_map_id = current_map
         viewer.last_seen_instance_uptime_ms = max(last_uptime, current_uptime)
+        viewer.last_reset_instance_uptime_ms = max(last_uptime, current_uptime)
         return True
     viewer.last_reset_reason = reset_reason
     viewer.last_reset_map_id = current_map
@@ -99,6 +136,18 @@ def process_chat_message(viewer, msg: Any) -> None:
 
     rarity = viewer._get_rarity_from_color_hex(color_hex) if color_hex else "Unknown"
     if not viewer._is_recent_duplicate(player_name, item_name, quantity, text):
+        try:
+            viewer._append_live_debug_log(
+                "viewer_chat_pickup_observed",
+                f"player={player_name} item={item_name} qty={int(quantity)}",
+                player_name=str(player_name or "").strip(),
+                item_name=str(item_name or "").strip(),
+                quantity=int(quantity),
+                rarity=str(rarity or "Unknown"),
+                source="chat",
+            )
+        except EXPECTED_RUNTIME_ERRORS:
+            pass
         viewer._log_drop_to_file(player_name, item_name, quantity, rarity)
         viewer.last_tracked_item_name = item_name
         viewer.last_tracked_item_quantity = int(quantity)
@@ -191,6 +240,23 @@ def run_update_tick(viewer) -> None:
                     return
                 viewer.last_seen_instance_uptime_ms = current_instance_uptime_ms
 
+        heartbeat_interval_s = max(1.0, float(getattr(viewer, "heartbeat_interval_s", 2.5) or 2.5))
+        last_heartbeat_log_at = float(getattr(viewer, "last_heartbeat_log_at", 0.0) or 0.0)
+        if (now - last_heartbeat_log_at) >= heartbeat_interval_s:
+            viewer.last_heartbeat_log_at = now
+            try:
+                viewer._append_live_debug_log(
+                    "viewer_runtime_heartbeat",
+                    f"map={int(current_map_id or 0)} uptime_ms={int(current_instance_uptime_ms or 0)}",
+                    current_map_id=int(current_map_id or 0),
+                    current_instance_uptime_ms=int(current_instance_uptime_ms or 0),
+                    status_message=str(getattr(viewer, "status_message", "") or "").strip(),
+                    log_path=str(getattr(viewer, "log_path", "") or "").strip(),
+                    live_debug_log_path=str(getattr(viewer, "live_debug_log_path", "") or "").strip(),
+                )
+            except EXPECTED_RUNTIME_ERRORS:
+                pass
+
         viewer._process_pending_identify_responses()
         viewer._run_auto_inventory_actions_tick()
         viewer._refresh_auto_inventory_pending_counts()
@@ -220,15 +286,22 @@ def run_update_tick(viewer) -> None:
             return
 
         current_len = len(chat_history)
+        new_messages = []
         if viewer.last_chat_index < 0:
-            viewer.last_chat_index = current_len
-            return
+            bootstrap_floor_index = viewer._safe_int(getattr(viewer, "chat_bootstrap_floor_index", -1), -1)
+            if bootstrap_floor_index >= 0:
+                start_index = bootstrap_floor_index if current_len >= bootstrap_floor_index else 0
+                new_messages = chat_history[start_index:]
+                viewer.last_chat_index = current_len
+                viewer.chat_bootstrap_floor_index = -1
+            else:
+                viewer.last_chat_index = current_len
+                return
 
         if current_len < viewer.last_chat_index:
             viewer.last_chat_index = 0
 
-        new_messages = []
-        if current_len > viewer.last_chat_index:
+        if not new_messages and current_len > viewer.last_chat_index:
             new_messages = chat_history[viewer.last_chat_index:]
             viewer.last_chat_index = current_len
 
