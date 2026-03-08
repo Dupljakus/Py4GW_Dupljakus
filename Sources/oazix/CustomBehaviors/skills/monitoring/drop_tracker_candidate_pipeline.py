@@ -9,6 +9,7 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_inventory_delt
 WORLD_CONFIRMATION_FALLBACK_REASONS = frozenset(
     {
         "new_slot",
+        "slot_replaced",
         "pending_same_slot_name_ready",
         "pending_itemid_name_ready",
         "stack_increase",
@@ -51,14 +52,9 @@ def _allow_world_confirmation_fallback(
         return False
     if bool(getattr(sender, "carryover_inventory_snapshot", {})):
         return False
-    recent_world_count = len(getattr(sender, "recent_world_item_disappearances", []) or [])
-    live_world_count = len(getattr(sender, "current_world_item_agents", {}) or {})
-    if reason == "stack_increase":
-        # Stack deltas can legitimately miss strict world-item matching due batching/races
-        # with repeated stack updates. Allow fallback once world scanning is active.
-        return bool(recent_world_count > 0 or live_world_count > 0)
-    if recent_world_count > 0 or live_world_count > 0:
-        return False
+    # Once world tracking has started in the session and identity is new,
+    # keep fallback available for all approved reasons so real pickups are not dropped
+    # when disappearance signal is briefly unavailable.
     return True
 
 
@@ -106,19 +102,36 @@ def log_candidate_pipeline(
 ) -> None:
     append_live_debug_log = getattr(sender, "_append_live_debug_log", None)
     if callable(append_live_debug_log) and bool(getattr(sender, "live_debug_detailed", True)):
-        append_live_debug_log(
-            "candidate_pipeline_summary",
-            (
-                f"confirmed={len(candidate_events)} "
-                f"suppressed_model_delta={int(suppressed_by_model_delta)} "
-                f"suppressed_world={len(suppressed_world_events)}"
-            ),
-            dedupe_key="candidate_pipeline_summary",
-            dedupe_interval_s=2.0,
-            confirmed_count=len(candidate_events),
-            suppressed_model_delta=int(suppressed_by_model_delta),
-            suppressed_world_count=len(suppressed_world_events),
+        summary_state = (
+            len(candidate_events),
+            int(suppressed_by_model_delta),
+            len(suppressed_world_events),
         )
+        previous_summary_state = getattr(sender, "_last_candidate_pipeline_summary_state", None)
+        should_emit_summary = summary_state != previous_summary_state
+        sender._last_candidate_pipeline_summary_state = summary_state
+        has_pipeline_activity = bool(candidate_events) or int(suppressed_by_model_delta) > 0 or bool(suppressed_world_events)
+        sender_runtime_id = str(getattr(sender, "sender_runtime_id", "") or "").strip()
+        dedupe_interval_s = 2.0 if has_pipeline_activity else 8.0
+        dedupe_key = (
+            f"candidate_pipeline_summary:{sender_runtime_id}"
+            if sender_runtime_id
+            else "candidate_pipeline_summary"
+        )
+        if should_emit_summary:
+            append_live_debug_log(
+                "candidate_pipeline_summary",
+                (
+                    f"confirmed={len(candidate_events)} "
+                    f"suppressed_model_delta={int(suppressed_by_model_delta)} "
+                    f"suppressed_world={len(suppressed_world_events)}"
+                ),
+                dedupe_key=dedupe_key,
+                dedupe_interval_s=dedupe_interval_s,
+                confirmed_count=len(candidate_events),
+                suppressed_model_delta=int(suppressed_by_model_delta),
+                suppressed_world_count=len(suppressed_world_events),
+            )
     if sender.debug_pipeline_logs and suppressed_by_model_delta > 0:
         Py4GW.Console.Log(
             "DropTrackerSender",

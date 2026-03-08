@@ -329,6 +329,79 @@ def _carryover_same_item(previous_entry: tuple, name_value: str, rarity_value: s
     )
 
 
+def _carryover_names_loosely_compatible(previous_name: str, current_name: str) -> bool:
+    previous_txt = str(previous_name or "").strip()
+    current_txt = str(current_name or "").strip()
+    previous_ready = bool(previous_txt and not previous_txt.startswith("Model#"))
+    current_ready = bool(current_txt and not current_txt.startswith("Model#"))
+    if not previous_ready or not current_ready:
+        return True
+    def _normalize_name_key(value: str) -> str:
+        normalized_tokens: list[str] = []
+        for token in str(value or "").strip().lower().split():
+            if token.endswith("'s"):
+                normalized_tokens.append(token)
+                continue
+            if token.endswith("s") and len(token) > 3:
+                normalized_tokens.append(token[:-1])
+                continue
+            normalized_tokens.append(token)
+        return " ".join(normalized_tokens)
+
+    previous_key = _normalize_name_key(previous_txt)
+    current_key = _normalize_name_key(current_txt)
+    if previous_key == current_key:
+        return True
+    if previous_key in current_key or current_key in previous_key:
+        return True
+    if previous_key.endswith("s") and previous_key[:-1] == current_key:
+        return True
+    if current_key.endswith("s") and current_key[:-1] == previous_key:
+        return True
+    return False
+
+
+def _candidate_matches_carryover_pool_loosely(
+    carryover_match_entries: list[dict[str, Any]],
+    name_value: str,
+    rarity_value: str,
+    model_value: int,
+) -> bool:
+    current_name = str(name_value or "").strip()
+    current_rarity = str(rarity_value or "Unknown")
+    current_model = int(model_value)
+    for entry in list(carryover_match_entries or []):
+        if not isinstance(entry, dict) or bool(entry.get("consumed", False)):
+            continue
+        if int(entry.get("model_id", 0)) != current_model:
+            continue
+        if str(entry.get("rarity", "Unknown") or "Unknown") != current_rarity:
+            continue
+        if _carryover_names_loosely_compatible(str(entry.get("name_key", "") or ""), current_name):
+            return True
+    return False
+
+
+def _startup_guard_immediate_reasons(sender) -> set[str]:
+    immediate_reasons = {
+        "stack_increase",
+        "pending_same_slot_name_ready",
+    }
+    transition_reason = str(getattr(sender, "last_session_transition_reason", "") or "").strip()
+    current_uptime_ms = max(0, int(getattr(sender, "last_seen_instance_uptime_ms", 0) or 0))
+    if transition_reason in {"instance_change", "viewer_sync_reset"} and current_uptime_ms <= 5000:
+        immediate_reasons.update(
+            {
+                "new_slot",
+                "pending_itemid_name_ready",
+                "pending_changed_slot_lookup",
+                "pending_model_rarity_lookup",
+                "stale_slot_ttl_fallback",
+            }
+        )
+    return immediate_reasons
+
+
 def _append_candidate_event(
     candidate_events: list[dict[str, Any]],
     changed_itemid_to_ready_name: dict[int, tuple[str, str]],
@@ -626,7 +699,23 @@ def process_inventory_deltas(sender) -> None:
 
     readiness = (float(sender.last_snapshot_ready) / float(sender.last_snapshot_total)) if sender.last_snapshot_total else 0.0
     if sender.session_startup_pending:
+        snapshot_credit = max(0, int(getattr(sender, "startup_stable_snapshot_credit", 0) or 0))
+        required_stable_snapshots = max(1, 2 - snapshot_credit)
         sender.stable_snapshot_count = sender.stable_snapshot_count + 1 if readiness >= 0.7 else 0
+        append_live_debug_log = getattr(sender, "_append_live_debug_log", None)
+        if callable(append_live_debug_log):
+            append_live_debug_log(
+                "sender_startup_cycle",
+                f"stable={int(sender.stable_snapshot_count)}/{int(required_stable_snapshots)}",
+                stable_snapshot_count=int(sender.stable_snapshot_count),
+                required_stable_snapshots=int(required_stable_snapshots),
+                readiness=round(readiness, 3),
+                carryover_count=len(baseline_snapshot),
+                transition_reason=str(getattr(sender, "last_session_transition_reason", "") or "").strip(),
+                snapshot_size=len(current_snapshot),
+                baseline_size=len(baseline_snapshot),
+                startup_stable_snapshot_credit=int(snapshot_credit),
+            )
         sender._log_reset_trace(
             (
                 f"RESET TRACE startup baseline actor={sender._reset_trace_actor_label()} size={len(current_snapshot)} "
@@ -635,14 +724,25 @@ def process_inventory_deltas(sender) -> None:
             ),
             consume_snapshot=True,
         )
-        if sender.stable_snapshot_count < 2:
+        if sender.stable_snapshot_count < required_stable_snapshots:
             sender.last_sent_count = 0
             _set_process_duration(sender, start_perf)
             return
         sender.session_startup_pending = False
         sender.is_warmed_up = True
         sender.stable_snapshot_count = 0
+        sender.startup_stable_snapshot_credit = 0
         sender.warmup_grace_until = 0.0
+        if callable(append_live_debug_log):
+            append_live_debug_log(
+                "sender_startup_completed",
+                f"carryover={len(baseline_snapshot)}",
+                readiness=round(readiness, 3),
+                carryover_count=len(baseline_snapshot),
+                transition_reason=str(getattr(sender, "last_session_transition_reason", "") or "").strip(),
+                snapshot_size=len(current_snapshot),
+                baseline_size=len(baseline_snapshot),
+            )
 
     if not sender.is_warmed_up:
         sender.stable_snapshot_count = sender.stable_snapshot_count + 1 if readiness >= 0.7 else 0
@@ -904,6 +1004,7 @@ def process_inventory_deltas(sender) -> None:
         now_ts,
     )
     candidate_events, suppressed_utility_kit_events = _partition_utility_kit_candidates(candidate_events)
+    suppressed_utility_kit_count = len(suppressed_utility_kit_events)
     if suppressed_utility_kit_events:
         if sender.debug_pipeline_logs:
             Py4GW.Console.Log(
@@ -925,22 +1026,30 @@ def process_inventory_deltas(sender) -> None:
     if candidate_events or sender.pending_slot_deltas:
         sender.last_inventory_activity_ts = time.time()
 
-    startup_guard_active = bool(carryover_suppression_active) and (
-        str(getattr(sender, "last_session_transition_reason", "") or "").strip() == "map_change"
-    )
+    transition_reason = str(getattr(sender, "last_session_transition_reason", "") or "").strip()
+    startup_guard_active = bool(carryover_suppression_active) and transition_reason in {
+        "map_change",
+        "instance_change",
+        "viewer_sync_reset",
+    }
     if startup_guard_active:
-        immediate_reasons = {
-            "stack_increase",
-            "pending_same_slot_name_ready",
-        }
-        immediate_events = [
-            event for event in candidate_events
-            if str(event.get("reason", "") or "").strip() in immediate_reasons
-        ]
-        startup_guarded_events = [
-            event for event in candidate_events
-            if str(event.get("reason", "") or "").strip() not in immediate_reasons
-        ]
+        immediate_reasons = _startup_guard_immediate_reasons(sender)
+        immediate_events: list[dict[str, Any]] = []
+        startup_guarded_events: list[dict[str, Any]] = []
+        for event in candidate_events:
+            reason = str(event.get("reason", "") or "").strip()
+            if reason not in immediate_reasons:
+                startup_guarded_events.append(event)
+                continue
+            if _candidate_matches_carryover_pool_loosely(
+                carryover_match_entries,
+                str(event.get("name", "") or ""),
+                str(event.get("rarity", "Unknown") or "Unknown"),
+                int(event.get("model_id", 0)),
+            ):
+                startup_guarded_events.append(event)
+                continue
+            immediate_events.append(event)
         confirmed_immediate, suppressed_by_model_delta_immediate, suppressed_world_events_immediate = confirm_candidate_events(
             sender=sender,
             candidate_events=immediate_events,
@@ -1006,5 +1115,32 @@ def process_inventory_deltas(sender) -> None:
             sender.carryover_suppression_until = 0.0
     else:
         sender.carryover_inventory_snapshot = {}
+        sender.startup_stable_snapshot_credit = 0
     sender.last_sent_count = sent_count if enqueued_count == 0 else min(enqueued_count, sent_count)
+    append_live_debug_log = getattr(sender, "_append_live_debug_log", None)
+    process_duration_ms = (time.perf_counter() - start_perf) * 1000.0
+    if callable(append_live_debug_log) and (
+        suppressed_utility_kit_count > 0
+        or int(suppressed_by_model_delta) > 0
+        or len(suppressed_world_events) > 0
+        or bool(startup_guard_active)
+    ):
+        sender_runtime_id = str(getattr(sender, "sender_runtime_id", "") or "").strip()
+        transition_key = str(transition_reason or "").strip() or "unknown"
+        append_live_debug_log(
+            "sender_inventory_perf",
+            f"process_ms={process_duration_ms:.2f}",
+            dedupe_key=f"sender_inventory_perf:{sender_runtime_id}:{transition_key}:{int(bool(startup_guard_active))}",
+            dedupe_interval_s=2.0 if bool(startup_guard_active) else 1.0,
+            process_duration_ms=round(process_duration_ms, 3),
+            candidate_count=len(candidate_events),
+            suppressed_utility_kit_count=int(suppressed_utility_kit_count),
+            suppressed_model_delta_count=int(suppressed_by_model_delta),
+            suppressed_world_count=len(suppressed_world_events),
+            startup_guard_active=bool(startup_guard_active),
+            transition_reason=str(transition_reason or "").strip(),
+            snapshot_size=len(current_snapshot),
+            baseline_size=len(baseline_snapshot),
+            pending_slot_count=len(sender.pending_slot_deltas),
+        )
     _set_process_duration(sender, start_perf)

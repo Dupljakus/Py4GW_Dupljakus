@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import shutil
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+from Sources.oazix.CustomBehaviors.tests import drop_test_event_reader as event_reader
 from Sources.oazix.CustomBehaviors.tests import drop_tracker_live_test_harness as harness
 from Sources.oazix.CustomBehaviors.tests import drop_tracker_live_test_report as report
+
+
+def _make_local_temp_dir() -> Path:
+    root = Path(".tmp") / "pytest-local"
+    root.mkdir(parents=True, exist_ok=True)
+    temp_dir = root / f"drop-live-test-report-{uuid.uuid4().hex}"
+    temp_dir.mkdir(parents=True, exist_ok=False)
+    return temp_dir
 
 
 def test_assess_summary_passes_clean_run():
@@ -34,6 +45,30 @@ def test_assess_summary_passes_clean_run():
     assert warnings == []
 
 
+def test_event_reader_load_csv_rows_skips_malformed_json_tail():
+    temp_dir = _make_local_temp_dir()
+    try:
+        target = temp_dir / "drop_log.csv"
+        target.write_text(
+            "\n".join(
+                [
+                    "Timestamp,ViewerBot,MapID,MapName,Player,ItemName,Quantity,Rarity,EventID,ItemStats,ItemID,SenderEmail",
+                    "2026-03-08 00:00:01,BotA,93,Spearhead Peak,Player One,Air Wand,1,Gold,ev-1,\"\",101,player1@test",
+                    '{"actor":"viewer","event":"viewer_runtime_heartbeat","message":"heartbeat","status_message":"Outpost Store: deposited 1 materials/tomes"}',
+                    "2026-03-08 00:00:02,BotA,93,Spearhead Peak,Player Two,Stone Summit Badge,1,White,ev-2,\"\",102,player2@test",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        rows = event_reader.load_csv_rows(target)
+
+        assert [str(row.get("EventID", "")) for row in rows] == ["ev-1", "ev-2"]
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_assess_summary_fails_problem_run():
     passed, failures, warnings = report.assess_summary(
         {
@@ -53,6 +88,8 @@ def test_assess_summary_fails_problem_run():
             "duplicate_event_count": 1,
             "suppressed_event_count": 3,
             "reset_event_count": 5,
+            "reset_runtime_count": 1,
+            "max_reset_events_per_runtime": 5,
         }
     )
 
@@ -66,6 +103,65 @@ def test_assess_summary_fails_problem_run():
     assert any("candidate suppression" in message for message in warnings)
     assert any("session reset" in message for message in warnings)
     assert any("repeated loot-table label" in message for message in warnings)
+
+
+def test_assess_summary_warns_with_runtime_distribution_for_partywide_resets():
+    passed, failures, warnings = report.assess_summary(
+        {
+            "accepted_count": 1,
+            "new_drop_rows": 1,
+            "sent_count": 1,
+            "acked_count": 1,
+            "send_failed_count": 0,
+            "rezone_count": 1,
+            "missing_in_csv": [],
+            "latest_session_missing_in_csv": [],
+            "missing_in_accepted": [],
+            "duplicate_drop_rows": [],
+            "duplicate_csv_event_ids": [],
+            "suspicious_name_update_count": 0,
+            "invalid_target_count": 0,
+            "duplicate_event_count": 0,
+            "suppressed_event_count": 0,
+            "reset_event_count": 95,
+            "reset_runtime_count": 8,
+            "max_reset_events_per_runtime": 13,
+        }
+    )
+
+    assert passed is True
+    assert failures == []
+    assert any("across 8 runtimes" in message for message in warnings)
+
+
+def test_assess_summary_reports_runtime_log_silence_after_reset():
+    passed, failures, warnings = report.assess_summary(
+        {
+            "accepted_count": 0,
+            "new_drop_rows": 0,
+            "sent_count": 0,
+            "acked_count": 0,
+            "send_failed_count": 0,
+            "rezone_count": 1,
+            "missing_in_csv": [],
+            "latest_session_missing_in_csv": [],
+            "missing_in_accepted": [],
+            "duplicate_drop_rows": [],
+            "duplicate_csv_event_ids": [],
+            "suspicious_name_update_count": 0,
+            "invalid_target_count": 0,
+            "duplicate_event_count": 0,
+            "suppressed_event_count": 0,
+            "reset_event_count": 16,
+            "reset_runtime_count": 8,
+            "max_reset_events_per_runtime": 2,
+            "runtime_log_silent_after_reset": True,
+        }
+    )
+
+    assert passed is False
+    assert any("went silent after reset" in message for message in failures)
+    assert any("session reset" in message for message in warnings)
 
 
 def test_assess_summary_fails_forbidden_rows_and_lifecycle_gaps():
@@ -120,6 +216,24 @@ def test_format_report_includes_recent_problem_details():
             "duplicate_event_count": 0,
             "suppressed_event_count": 0,
             "reset_event_count": 0,
+            "reset_runtime_breakdown": [
+                {
+                    "actor": "viewer",
+                    "runtime_id": "viewer-g1-i1-p123",
+                    "count": 4,
+                    "latest_reason": "viewer_instance_reset",
+                    "latest_caller": "draw_window",
+                }
+            ],
+            "noise_cost_summary": {
+                "assessment": "mostly_messy",
+                "viewer_reset_perf_count": 4,
+                "viewer_reset_perf_avg_ms": 3.25,
+                "viewer_reset_perf_max_ms": 7.5,
+                "sender_noise_perf_count": 2,
+                "sender_noise_perf_avg_ms": 5.5,
+                "sender_noise_perf_max_ms": 8.25,
+            },
             "suspicious_name_updates": [
                 {"previous_name": "Bog Skale Fin", "new_name": "Necromancer Tome"}
             ],
@@ -187,6 +301,10 @@ def test_format_report_includes_recent_problem_details():
     assert "follower@test -> leader@test: events=1 sent=1 accepted=0 acked=0 csv=0 problems=1" in rendered
     assert "ev=ev-problem follower@test -> leader@test gaps=sent_missing_accepted sides=receiver" in rendered
     assert "map=54 uptime_ms=1310" in rendered
+    assert "Reset Distribution:" in rendered
+    assert "viewer viewer-g1-i1-p123: count=4 latest_reason=viewer_instance_reset caller=draw_window" in rendered
+    assert "Noise Cost:" in rendered
+    assert "assessment=mostly_messy" in rendered
 
 
 def test_summarize_detects_forbidden_kit_rows_and_lifecycle_gap():
@@ -259,6 +377,107 @@ def test_summarize_tracks_sender_receiver_route_and_problem_side():
     assert problem_rows[0]["primary_owner_hint"] == "receiver"
 
 
+def test_summarize_filters_unknown_route_without_meaningful_signal():
+    summary = harness._summarize(
+        [],
+        [
+            {
+                "event": "candidate_confirmed",
+                "event_id": "ev-orphan",
+                "sender_email": "follower@test",
+                "item_name": "Bone",
+                "ts": "2026-03-05 18:10:00.000",
+            }
+        ],
+    )
+
+    assert list(summary.get("route_lifecycle", []) or []) == []
+    assert list(summary.get("receiver_lifecycle", []) or []) == []
+
+
+def test_summarize_treats_recovered_send_failure_as_warning_not_gap():
+    summary = harness._summarize(
+        [
+            {
+                "Timestamp": "2026-03-05 18:10:01.000",
+                "EventID": "ev-retry",
+                "ItemName": "Insightful Accursed Staff",
+                "Quantity": "1",
+                "Rarity": "Gold",
+                "Player": "Mesmer Jedan",
+                "SenderEmail": "sender@test",
+                "ItemStats": "Insightful Accursed Staff\nValue: 240 gold",
+            }
+        ],
+        [
+            {
+                "event": "tracker_transport_target_resolved",
+                "event_id": "ev-retry",
+                "sender_email": "sender@test",
+                "receiver_email": "leader@test",
+                "receiver_in_party": True,
+                "role": "follower",
+                "item_name": "Insightful Accursed Staff",
+                "ts": "2026-03-05 18:10:00.000",
+            },
+            {
+                "event": "tracker_drop_send_failed",
+                "event_id": "ev-retry",
+                "sender_email": "sender@test",
+                "receiver_email": "leader@test",
+                "item_name": "Insightful Accursed Staff",
+                "ts": "2026-03-05 18:10:00.010",
+            },
+            {
+                "event": "tracker_drop_sent",
+                "event_id": "ev-retry",
+                "sender_email": "sender@test",
+                "receiver_email": "leader@test",
+                "item_name": "Insightful Accursed Staff",
+                "ts": "2026-03-05 18:10:00.020",
+            },
+            {
+                "event": "viewer_drop_accepted",
+                "event_id": "ev-retry",
+                "sender_email": "sender@test",
+                "receiver_email": "leader@test",
+                "item_name": "Insightful Accursed Staff",
+                "ts": "2026-03-05 18:10:00.030",
+            },
+            {
+                "event": "tracker_drop_acked",
+                "event_id": "ev-retry",
+                "sender_email": "sender@test",
+                "receiver_email": "leader@test",
+                "item_name": "Insightful Accursed Staff",
+                "ts": "2026-03-05 18:10:00.040",
+            },
+            {
+                "event": "viewer_stats_text_bound",
+                "event_id": "ev-retry",
+                "sender_email": "sender@test",
+                "receiver_email": "leader@test",
+                "player_name": "Mesmer Jedan",
+                "ts": "2026-03-05 18:10:00.050",
+            },
+        ],
+    )
+
+    assert int(summary.get("send_failed_count", 0) or 0) == 0
+    assert int(summary.get("send_failed_raw_count", 0) or 0) == 1
+    assert int(summary.get("send_failed_recovered_count", 0) or 0) == 1
+    assert int(summary.get("lifecycle_gap_count", 0) or 0) == 0
+    lifecycle_rows = list(summary.get("lifecycle_rows", []) or [])
+    assert lifecycle_rows[0]["send_failed"] is True
+    assert lifecycle_rows[0]["send_failed_unresolved"] is False
+    assert lifecycle_rows[0]["send_failed_recovered"] is True
+    assert lifecycle_rows[0]["problem_event"] is False
+    assert list(summary.get("problem_lifecycle_rows", []) or []) == []
+    recovered_rows = list(summary.get("send_failed_recovered_events", []) or [])
+    assert len(recovered_rows) == 1
+    assert recovered_rows[0]["event_id"] == "ev-retry"
+
+
 def test_write_bug_bundle_if_failed_creates_artifact(tmp_path, monkeypatch):
     bundle_dir = tmp_path / "bundles"
     monkeypatch.setattr(report.harness, "BUNDLE_DIR", bundle_dir, raising=False)
@@ -298,6 +517,38 @@ def test_write_bug_bundle_if_failed_creates_artifact(tmp_path, monkeypatch):
     artifact_path = bundle_dir / Path(path).name
     assert artifact_path.exists()
 
+
+def test_assess_summary_warns_on_recovered_send_retry_only():
+    passed, failures, warnings = report.assess_summary(
+        {
+            "accepted_count": 1,
+            "new_drop_rows": 1,
+            "sent_count": 1,
+            "acked_count": 1,
+            "send_failed_count": 0,
+            "send_failed_recovered_count": 1,
+            "rezone_count": 0,
+            "missing_in_csv": [],
+            "latest_session_missing_in_csv": [],
+            "missing_in_accepted": [],
+            "duplicate_drop_rows": [],
+            "duplicate_csv_event_ids": [],
+            "suspicious_name_update_count": 0,
+            "stats_name_mismatch_count": 0,
+            "invalid_target_count": 0,
+            "forbidden_row_count": 0,
+            "lifecycle_gap_count": 0,
+            "accepted_missing_stats_binding_count": 0,
+            "duplicate_event_count": 0,
+            "suppressed_event_count": 0,
+            "reset_event_count": 0,
+        }
+    )
+
+    assert passed is True
+    assert failures == []
+    assert any("recovered on retry" in message for message in warnings)
+
 def test_collect_likely_rezones_clusters_reset_churn():
     rezones = harness._collect_likely_rezones(
         [
@@ -330,6 +581,119 @@ def test_collect_likely_rezones_clusters_reset_churn():
     assert rezones[0]["reasons"] == ["viewer_instance_reset", "viewer_sync_reset"]
     assert rezones[1]["current_map_id"] == 14
     assert rezones[1]["reasons"] == ["instance_change"]
+
+
+def test_summarize_builds_reset_runtime_breakdown():
+    summary = harness._summarize(
+        [],
+        [
+            {
+                "actor": "viewer",
+                "event": "viewer_session_reset",
+                "reason": "viewer_instance_reset",
+                "current_map_id": 54,
+                "current_instance_uptime_ms": 1200,
+                "viewer_runtime_id": "viewer-g1-i1-p123",
+                "update_caller": "draw_window",
+                "ts": "2026-03-04 19:10:00.000",
+            },
+            {
+                "actor": "viewer",
+                "event": "viewer_session_reset",
+                "reason": "viewer_instance_reset",
+                "current_map_id": 54,
+                "current_instance_uptime_ms": 1500,
+                "viewer_runtime_id": "viewer-g1-i1-p123",
+                "update_caller": "draw_window",
+                "ts": "2026-03-04 19:10:01.000",
+            },
+            {
+                "actor": "sender",
+                "event": "sender_session_reset",
+                "reason": "instance_change",
+                "current_map_id": 54,
+                "current_instance_uptime_ms": 3100,
+                "sender_runtime_id": "sender-g1-p456",
+                "reset_source_caller": "run_sender_tick",
+                "ts": "2026-03-04 19:10:01.500",
+            },
+        ],
+    )
+
+    assert int(summary.get("reset_event_count", 0) or 0) == 3
+    assert int(summary.get("reset_runtime_count", 0) or 0) == 2
+    assert int(summary.get("max_reset_events_per_runtime", 0) or 0) == 2
+    breakdown = list(summary.get("reset_runtime_breakdown", []) or [])
+    assert breakdown[0]["runtime_id"] == "viewer-g1-i1-p123"
+    assert int(breakdown[0]["count"] or 0) == 2
+    assert breakdown[0]["latest_caller"] == "draw_window"
+
+
+def test_summarize_builds_noise_cost_summary_from_perf_events():
+    summary = harness._summarize(
+        [],
+        [
+            {
+                "event": "viewer_reset_perf",
+                "duration_ms": 4.0,
+                "ts": "2026-03-04 19:10:00.000",
+            },
+            {
+                "event": "viewer_reset_perf",
+                "duration_ms": 8.0,
+                "ts": "2026-03-04 19:10:01.000",
+            },
+            {
+                "event": "sender_inventory_perf",
+                "process_duration_ms": 6.5,
+                "suppressed_utility_kit_count": 2,
+                "ts": "2026-03-04 19:10:01.500",
+            },
+        ],
+    )
+
+    noise_cost = dict(summary.get("noise_cost_summary", {}) or {})
+    assert noise_cost["assessment"] == "mostly_messy"
+    assert int(noise_cost["viewer_reset_perf_count"]) == 2
+    assert float(noise_cost["viewer_reset_perf_avg_ms"]) == 6.0
+    assert float(noise_cost["viewer_reset_perf_max_ms"]) == 8.0
+    assert int(noise_cost["sender_noise_perf_count"]) == 1
+    assert float(noise_cost["sender_noise_perf_max_ms"]) == 6.5
+
+
+def test_assess_summary_warns_when_chat_pickup_observer_is_disabled():
+    passed, failures, warnings = report.assess_summary(
+        {
+            "accepted_count": 0,
+            "new_drop_rows": 0,
+            "send_failed_count": 0,
+            "missing_in_csv": [],
+            "latest_session_missing_in_csv": [],
+            "missing_in_accepted": [],
+            "duplicate_drop_rows": [],
+            "duplicate_csv_event_ids": [],
+            "suspicious_name_update_count": 0,
+            "stats_name_mismatch_count": 0,
+            "invalid_target_count": 0,
+            "duplicate_event_count": 0,
+            "suppressed_event_count": 0,
+            "reset_event_count": 0,
+            "reset_runtime_count": 0,
+            "max_reset_events_per_runtime": 0,
+            "send_failed_recovered_count": 0,
+            "rezone_count": 0,
+            "forbidden_row_count": 0,
+            "lifecycle_gap_count": 0,
+            "accepted_missing_stats_binding_count": 0,
+            "chat_pickup_count": 0,
+            "uncorrelated_chat_pickup_count": 0,
+            "chat_item_tracking_enabled": False,
+        }
+    )
+
+    assert passed is False
+    assert failures == ["No tracked drops were captured during the test window."]
+    assert "Pickup Watch was OFF for this run; missing chat pickup rows are not evidence that pickups did not happen." in warnings
 
 
 def test_collect_likely_rezones_clusters_high_uptime_and_startup_resets_on_same_map():

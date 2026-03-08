@@ -93,6 +93,13 @@ def _effective_optional_indices(
     return effective_event_idx, effective_stats_idx, effective_item_id_idx, effective_sender_idx
 
 
+def _looks_like_diagnostics_json_row(csv_row: list[str]) -> bool:
+    if not isinstance(csv_row, list) or not csv_row:
+        return False
+    first_cell = str(csv_row[0] or "").strip()
+    return first_cell.startswith("{") and '"actor"' in first_cell and '"event"' in first_cell
+
+
 def parse_drop_log_reader(
     reader: Any,
     map_name_resolver: Callable[[int], str] | None = None,
@@ -129,6 +136,8 @@ def parse_drop_log_reader(
         row_iter = _iter_rows()
 
     for csv_row in row_iter:
+        if _looks_like_diagnostics_json_row(list(csv_row)):
+            continue
         fallback_map_name = "Unknown"
         if not has_map_name and map_name_resolver is not None:
             try:

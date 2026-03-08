@@ -311,7 +311,17 @@ def poll_shared_memory(viewer) -> None:
                         py4gw_api.Console.MessageType.Warning,
                     )
                 try:
-                    if should_finish:
+                    finish_on_error = bool(should_finish)
+                    if not finish_on_error:
+                        inventory_action_tag = str(getattr(viewer, "inventory_action_tag", "") or "").strip()
+                        inventory_stats_request_tag = str(getattr(viewer, "inventory_stats_request_tag", "") or "").strip()
+                        tag_hint_normalized = str(tag_hint or "").strip()
+                        finish_on_error = bool(
+                            tag_hint_normalized.startswith("Tracker")
+                            or (inventory_action_tag and tag_hint_normalized == inventory_action_tag)
+                            or (inventory_stats_request_tag and tag_hint_normalized == inventory_stats_request_tag)
+                        )
+                    if finish_on_error:
                         shmem.MarkMessageAsFinished(my_email, msg_idx)
                 except (TypeError, ValueError, RuntimeError, AttributeError):
                     pass

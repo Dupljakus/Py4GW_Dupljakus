@@ -186,6 +186,29 @@ def test_parse_drop_log_file_roundtrip():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_parse_drop_log_file_ignores_diagnostics_json_rows():
+    temp_dir = _make_local_temp_dir()
+    try:
+        file_path = temp_dir / "drops.csv"
+        file_path.write_text(
+            "\n".join(
+                [
+                    "Timestamp,ViewerBot,MapID,MapName,Player,ItemName,Quantity,Rarity,EventID,ItemStats,ItemID,SenderEmail",
+                    "2026-03-08 00:00:01,BotA,93,Spearhead Peak,Player One,Air Wand,1,Gold,ev-1,\"\",101,player1@test",
+                    '{"actor":"viewer","event":"viewer_runtime_heartbeat","message":"heartbeat","log_path":"Py4GW/drop_log.csv"}',
+                    "2026-03-08 00:00:02,BotA,93,Spearhead Peak,Player Two,Stone Summit Badge,1,White,ev-2,\"\",102,player2@test",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        parsed = parse_drop_log_file(str(file_path))
+        assert [row.event_id for row in parsed] == ["ev-1", "ev-2"]
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def test_append_drop_log_rows_writes_header_once():
     temp_dir = _make_local_temp_dir()
     file_path = temp_dir / "append_log.csv"

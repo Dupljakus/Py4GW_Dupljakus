@@ -4,6 +4,9 @@ import shutil
 import uuid
 from pathlib import Path
 
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_event_emitter import append_event_payload_jsonl
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_event_schema import build_event_payload
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_event_schema import normalize_parsed_event_payload
 from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_live_debug import append_live_debug_log
 from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_live_debug import format_live_debug_record
 from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_live_debug import get_live_debug_log_path
@@ -101,5 +104,69 @@ def test_get_live_debug_log_path_uses_drop_log_directory():
         expected = temp_dir / "drop_tracker_live_debug.jsonl"
         resolved = Path(get_live_debug_log_path(str(drop_log_path)))
         assert resolved == expected
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_build_event_payload_normalizes_fields_without_changing_base_shape():
+    payload = build_event_payload(
+        ts="2026-03-07 19:10:00.000",
+        actor="viewer",
+        event="viewer_session_reset",
+        message="reason=viewer_instance_reset",
+        count=3,
+        meta={"slot": (1, 2)},
+    )
+
+    assert payload["ts"] == "2026-03-07 19:10:00.000"
+    assert payload["actor"] == "viewer"
+    assert payload["event"] == "viewer_session_reset"
+    assert payload["message"] == "reason=viewer_instance_reset"
+    assert payload["count"] == 3
+    assert payload["meta"] == {"slot": [1, 2]}
+
+
+def test_append_event_payload_jsonl_writes_compatible_live_debug_row():
+    temp_dir = _make_local_temp_dir()
+    try:
+        target_path = temp_dir / "drop_tracker_live_debug.jsonl"
+        append_event_payload_jsonl(
+            path=str(target_path),
+            ts="2026-03-07 19:11:00.000",
+            actor="sender",
+            event="sender_session_reset",
+            message="transition=instance_change",
+            sender_runtime_id="sender-g1-p123",
+        )
+        rows = read_live_debug_records(log_path=str(target_path), max_lines=10)
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "sender"
+        assert rows[0]["event"] == "sender_session_reset"
+        assert rows[0]["sender_runtime_id"] == "sender-g1-p123"
+        assert normalize_parsed_event_payload(rows[0])["event"] == "sender_session_reset"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_append_live_debug_log_reserved_log_path_field_does_not_redirect_sink():
+    temp_dir = _make_local_temp_dir()
+    try:
+        drop_log_path = temp_dir / "drop_log.csv"
+        debug_log_path = temp_dir / "drop_tracker_live_debug.jsonl"
+        append_live_debug_log(
+            actor="viewer",
+            event="viewer_runtime_heartbeat",
+            message="heartbeat",
+            drop_log_path=str(drop_log_path),
+            log_path=str(drop_log_path),
+            live_debug_log_path=str(debug_log_path),
+        )
+
+        assert drop_log_path.exists() is False or drop_log_path.read_text(encoding="utf-8") == ""
+        rows = read_live_debug_records(log_path=str(debug_log_path), max_lines=10)
+        assert len(rows) == 1
+        assert rows[0]["event"] == "viewer_runtime_heartbeat"
+        assert rows[0]["payload_log_path"] == str(drop_log_path)
+        assert rows[0]["live_debug_log_path"] == str(debug_log_path)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

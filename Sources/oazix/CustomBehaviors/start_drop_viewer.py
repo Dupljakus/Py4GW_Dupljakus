@@ -62,6 +62,7 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_batch_store imp
 from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_filters import (
     get_filtered_aggregated,
     get_filtered_rows,
+    get_table_rows,
     is_gold_row,
     is_rare_rarity,
     passes_filters,
@@ -257,6 +258,7 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_session_runtime
     begin_new_explorable_session,
     clear_map_watch_lines,
     clear_reset_trace_lines,
+    drain_pending_tracker_messages,
     flush_pending_tracker_messages,
     get_map_watch_lines,
     get_reset_trace_lines,
@@ -277,6 +279,7 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_runtime_update 
     run_update_tick,
 )
 from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_status_runtime import (
+    arm_chat_history_catchup,
     get_rarity_color,
     send_tracker_ack,
     set_paused,
@@ -408,6 +411,8 @@ _DROP_VIEWER_RELOAD_SCAN_INTERVAL_S = 1.0
 _DROP_VIEWER_LAST_RELOAD_SCAN_TS = float(globals().get("_DROP_VIEWER_LAST_RELOAD_SCAN_TS", 0.0))
 _DROP_VIEWER_RELOAD_MTIMES = dict(globals().get("_DROP_VIEWER_RELOAD_MTIMES", {}) or {})
 _DROP_VIEWER_RELOAD_IN_PROGRESS = bool(globals().get("_DROP_VIEWER_RELOAD_IN_PROGRESS", False))
+_DROP_VIEWER_RUNTIME_GENERATION = int(globals().get("_DROP_VIEWER_RUNTIME_GENERATION", 0) or 0) + 1
+_DROP_VIEWER_RUNTIME_INSTANCE_COUNTER = int(globals().get("_DROP_VIEWER_RUNTIME_INSTANCE_COUNTER", 0) or 0)
 
 _DROP_VIEWER_RELOAD_EXCLUDED_FIELDS = {
     "window_name",
@@ -711,9 +716,18 @@ except IMPORT_OPTIONAL_ERRORS:
 
 class DropViewerWindow:
     def __init__(self):
+        global _DROP_VIEWER_RUNTIME_INSTANCE_COUNTER
+        _DROP_VIEWER_RUNTIME_INSTANCE_COUNTER += 1
         self.window_name = "Drop Tracker Viewer"
         self.log_path = constants.DROP_LOG_PATH
         self.saved_logs_dir = os.path.join(os.path.dirname(constants.DROP_LOG_PATH), "SavedLogs")
+        self.viewer_runtime_generation = int(_DROP_VIEWER_RUNTIME_GENERATION)
+        self.viewer_runtime_instance_seq = int(_DROP_VIEWER_RUNTIME_INSTANCE_COUNTER)
+        self.viewer_runtime_id = (
+            f"viewer-g{int(self.viewer_runtime_generation)}"
+            f"-i{int(self.viewer_runtime_instance_seq)}"
+            f"-p{int(os.getpid())}"
+        )
         
         # Data
         self.raw_drops = []
@@ -738,8 +752,14 @@ class DropViewerWindow:
         # Logging State
         self.last_processed_message = None
         self.last_update_time = 0
+        self.last_update_caller = ""
+        self.last_update_sequence = 0
+        self.last_update_started_at = 0.0
+        self.last_heartbeat_log_at = 0.0
+        self.heartbeat_interval_s = 2.5
         self.chat_requested = False
         self.last_chat_index = -1
+        self.chat_bootstrap_floor_index = -1
         self.last_tracked_item_name = ""
         self.last_tracked_item_quantity = 0
         self.last_tracked_item_rarity = ""
@@ -773,6 +793,7 @@ class DropViewerWindow:
         self.model_name_by_id = {}
         self.sender_session_floor_by_email = {}
         self.sender_session_last_seen_by_email = {}
+        self.live_session_log_floor_row_count = 0
         self.mod_db = self._load_mod_database()
         self.known_mod_ids = self._collect_known_mod_ids()
         self.unknown_mod_exclude_ids = set(UNKNOWN_MOD_EXCLUDE_IDS)
@@ -816,6 +837,7 @@ class DropViewerWindow:
         self._load_unknown_mod_name_map()
         self._prune_resolved_unknown_mod_entries()
         self.enable_chat_item_tracking = False
+        self.chat_dedupe_window_s = 2.0
         self.max_shmem_messages_per_tick = 80
         self.max_shmem_scan_per_tick = 600
         self.verbose_shmem_item_logs = False
@@ -906,6 +928,11 @@ class DropViewerWindow:
         self.auto_salvage_total_queued = 0
         self.auto_id_last_run_ts = 0.0
         self.auto_salvage_last_run_ts = 0.0
+        self.auto_id_selected_stats_refresh_interval_s = 2.0
+        self.auto_id_selected_stats_refresh_last_ts = 0.0
+        self.auto_id_background_stats_refresh_interval_s = 1.0
+        self.auto_id_background_stats_refresh_last_ts = 0.0
+        self.auto_id_background_stats_scan_cursor = 0
         self.auto_monitoring_settle_seconds = 1.2
         self.auto_monitoring_last_gate_status_ts = 0.0
         self.strict_event_stats_binding = True
@@ -973,6 +1000,21 @@ class DropViewerWindow:
         self.selected_log_row = None
         self.hover_preview_item_key = None
         self.hover_preview_log_row = None
+        self.hover_preview_debounce_s = 0.14
+        self.hover_preview_debounce_key = None
+        self.hover_preview_debounce_ts = 0.0
+        self._ui_row_stats_cache = {}
+        self._ui_selected_item_stats_cache = {}
+        self._ui_selected_rows_cache = {}
+        self._runtime_rows_version = 0
+        self._cached_filtered_rows = {}
+        self._cached_filtered_aggregated = {}
+        self._cached_table_rows = {}
+        self._cached_summary_metrics = {}
+        self._cached_best_row_lookup = {}
+        self._cached_log_row_entries = {}
+        self.log_latest_n_enabled = True
+        self.log_latest_n = 200
         self.hover_handle_mode = False
         self.hover_pin_open = False
         self.hover_is_visible = True
@@ -996,9 +1038,10 @@ class DropViewerWindow:
 
         self._load_runtime_config()
         self._load_ui_layout_from_config()
-        # Auto-refresh preserves the active session instead of wiping the live log.
+        # Default startup should clear only runtime state; truncating the live CSV is
+        # reserved for explicit user resets so reloads/rebuilds cannot drop prior rows.
         if not _DROP_VIEWER_SKIP_LIVE_SESSION_RESET:
-            self._reset_live_session()
+            self._reset_live_session(preserve_live_log=True)
 
     def _default_runtime_config(self):
         return default_runtime_config(self)
@@ -1036,6 +1079,12 @@ class DropViewerWindow:
         return send_tracker_ack(self, receiver_email, event_id)
 
     def _append_live_debug_log(self, event: str, message: str, **fields: Any):
+        if "viewer_runtime_id" not in fields:
+            fields["viewer_runtime_id"] = str(getattr(self, "viewer_runtime_id", "") or "")
+        if "viewer_runtime_generation" not in fields:
+            fields["viewer_runtime_generation"] = int(getattr(self, "viewer_runtime_generation", 0) or 0)
+        if "viewer_runtime_instance_seq" not in fields:
+            fields["viewer_runtime_instance_seq"] = int(getattr(self, "viewer_runtime_instance_seq", 0) or 0)
         return append_live_debug_log(
             actor="viewer",
             event=event,
@@ -1116,6 +1165,57 @@ class DropViewerWindow:
 
     def _clean_item_name(self, name: Any) -> str:
         return clean_item_name(self, name)
+
+    def _get_rarity_from_color_hex(self, color_hex: Any) -> str:
+        raw = self._ensure_text(color_hex).strip().lstrip("#")
+        compact = "".join(ch for ch in raw if ch.isalnum()).upper()
+        if len(compact) < 6:
+            return "Unknown"
+        candidates = {compact[:6], compact[-6:]}
+        if candidates.intersection({"FFD700", "FFCC00", "FFC800", "FFB700", "FFF200"}):
+            return "Gold"
+        if candidates.intersection({"C080FF", "B58CFF", "A86CFF", "A000FF", "B26BFF"}):
+            return "Purple"
+        if candidates.intersection({"66CCFF", "6699FF", "99CCFF", "00B3FF", "5CA9FF"}):
+            return "Blue"
+        if candidates.intersection({"33CC33", "66FF66", "00CC66", "00FF66", "66CC66"}):
+            return "Green"
+        if candidates.intersection({"FFFFFF", "F2F2F2", "E6E6E6"}):
+            return "White"
+        return "Unknown"
+
+    def _is_recent_duplicate(
+        self,
+        player_name: str,
+        item_name: str,
+        quantity: int,
+        raw_message_text: str = "",
+    ) -> bool:
+        cache = getattr(self, "recent_log_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.recent_log_cache = cache
+        try:
+            dedupe_window_s = max(0.5, min(10.0, float(getattr(self, "chat_dedupe_window_s", 2.0) or 2.0)))
+        except EXPECTED_RUNTIME_ERRORS:
+            dedupe_window_s = 2.0
+        now_ts = float(time.time())
+        key = make_chat_dedupe_key(
+            player_name=self._ensure_text(player_name),
+            item_name=self._clean_item_name(item_name),
+            quantity=max(1, int(self._safe_int(quantity, 1))),
+            raw_message_text=self._ensure_text(raw_message_text),
+        )
+        previous_ts = float(cache.get(key, 0.0) or 0.0)
+        cache[key] = now_ts
+        if len(cache) > 256:
+            floor_ts = now_ts - dedupe_window_s
+            self.recent_log_cache = {
+                cache_key: float(ts)
+                for cache_key, ts in list(cache.items())
+                if float(ts) >= floor_ts
+            }
+        return previous_ts > 0.0 and (now_ts - previous_ts) <= dedupe_window_s
 
     def _display_player_name(self, player_name: Any, sender_email: Any = "") -> str:
         return display_player_name(self, player_name, sender_email)
@@ -1454,15 +1554,59 @@ class DropViewerWindow:
         current_instance_uptime_ms: int = 0,
         status_message: str = "Auto reset on map change",
     ):
-        self._append_live_debug_log(
-            "viewer_session_reset",
-            f"reason={str(reason or '').strip() or 'unknown'}",
-            reason=str(reason or "").strip() or "unknown",
-            current_map_id=int(current_map_id or 0),
-            current_instance_uptime_ms=int(current_instance_uptime_ms or 0),
-            status_message=str(status_message or ""),
-            total_drops=int(self.total_drops),
+        normalized_reason = str(reason or "").strip() or "unknown"
+        normalized_map_id = int(current_map_id or 0)
+        normalized_uptime_ms = int(current_instance_uptime_ms or 0)
+        now_ts = time.time()
+        last_logged_reason = str(getattr(self, "last_viewer_reset_log_reason", "") or "").strip()
+        last_logged_map_id = int(getattr(self, "last_viewer_reset_log_map_id", 0) or 0)
+        last_logged_uptime_ms = int(getattr(self, "last_viewer_reset_log_instance_uptime_ms", 0) or 0)
+        last_logged_at = float(getattr(self, "last_viewer_reset_log_started_at", 0.0) or 0.0)
+        same_low_uptime_window = (
+            normalized_map_id > 0
+            and normalized_map_id == last_logged_map_id
+            and (now_ts - last_logged_at) <= 8.0
+            and normalized_uptime_ms > 0
+            and last_logged_uptime_ms > 0
+            and normalized_uptime_ms <= 5000
+            and last_logged_uptime_ms <= 5000
         )
+        duplicate_reset_log = (
+            normalized_map_id > 0
+            and normalized_map_id == last_logged_map_id
+            and (now_ts - last_logged_at) <= 8.0
+            and normalized_uptime_ms > 0
+            and last_logged_uptime_ms > 0
+            and (
+                same_low_uptime_window
+                or (
+                    normalized_reason == last_logged_reason
+                    and abs(normalized_uptime_ms - last_logged_uptime_ms) <= 2500
+                )
+            )
+        )
+        if not duplicate_reset_log:
+            self._append_live_debug_log(
+                "viewer_session_reset",
+                f"reason={normalized_reason}",
+                reason=normalized_reason,
+                current_map_id=normalized_map_id,
+                current_instance_uptime_ms=normalized_uptime_ms,
+                status_message=str(status_message or ""),
+                total_drops=int(self.total_drops),
+                update_caller=str(getattr(self, "last_update_caller", "") or ""),
+                update_sequence=int(getattr(self, "last_update_sequence", 0) or 0),
+                update_started_at=float(getattr(self, "last_update_started_at", 0.0) or 0.0),
+                reload_in_progress=bool(_DROP_VIEWER_RELOAD_IN_PROGRESS),
+            )
+            self.last_viewer_reset_log_reason = normalized_reason
+            self.last_viewer_reset_log_map_id = normalized_map_id
+            self.last_viewer_reset_log_instance_uptime_ms = normalized_uptime_ms
+            self.last_viewer_reset_log_started_at = now_ts
+        else:
+            if same_low_uptime_window:
+                self.last_viewer_reset_log_reason = normalized_reason
+            self.last_viewer_reset_log_instance_uptime_ms = max(last_logged_uptime_ms, normalized_uptime_ms)
         return begin_new_explorable_session(
             self,
             reason,
@@ -1470,6 +1614,15 @@ class DropViewerWindow:
             current_instance_uptime_ms,
             status_message,
         )
+
+    def _mark_update_invocation(self, caller: str):
+        self.last_update_caller = str(caller or "").strip()
+        self.last_update_sequence = int(getattr(self, "last_update_sequence", 0) or 0) + 1
+        self.last_update_started_at = float(time.time())
+
+
+    def _drain_pending_tracker_messages(self, max_passes: int = 6) -> int:
+        return drain_pending_tracker_messages(self, max_passes)
 
 
     def _flush_pending_tracker_messages(self) -> int:
@@ -1489,6 +1642,9 @@ class DropViewerWindow:
 
     def _set_paused(self, paused: bool):
         return set_paused(self, paused)
+
+    def _arm_chat_history_catchup(self):
+        return arm_chat_history_catchup(self)
 
     def _toggle_follower_inventory_viewer(self):
         return toggle_follower_inventory_viewer(self)
@@ -1543,8 +1699,28 @@ class DropViewerWindow:
             player_name=player_name,
         )
 
+    def _mark_rows_changed(self, reason: str = "", clear_selection_cache: bool = True) -> int:
+        try:
+            current_version = max(0, int(getattr(self, "_runtime_rows_version", 0) or 0))
+        except EXPECTED_RUNTIME_ERRORS:
+            current_version = 0
+        next_version = current_version + 1
+        self._runtime_rows_version = next_version
+        self._cached_filtered_rows = {}
+        self._cached_filtered_aggregated = {}
+        self._cached_table_rows = {}
+        self._cached_summary_metrics = {}
+        self._cached_best_row_lookup = {}
+        self._cached_log_row_entries = {}
+        if clear_selection_cache:
+            self._ui_selected_item_stats_cache = {}
+            self._ui_selected_rows_cache = {}
+        return next_version
+
     def _rebuild_aggregates_from_raw_drops(self) -> None:
-        return rebuild_aggregates_from_raw_drops(self)
+        rebuild_aggregates_from_raw_drops(self)
+        self._mark_rows_changed("rebuild_aggregates")
+        return None
 
     def _is_rare_rarity(self, rarity):
         return is_rare_rarity(self, rarity)
@@ -1554,6 +1730,9 @@ class DropViewerWindow:
 
     def _get_filtered_rows(self):
         return get_filtered_rows(self)
+
+    def _get_table_rows(self, filtered_rows, view_mode: str = ""):
+        return get_table_rows(self, filtered_rows, view_mode)
 
     def _is_gold_row(self, row):
         return is_gold_row(self, row)
@@ -1772,7 +1951,8 @@ class DropViewerWindow:
         return item_names_match(self, selected_name, row_name)
 
     def _clear_hover_item_preview(self) -> None:
-        return clear_hover_item_preview(self)
+        clear_hover_item_preview(self)
+        return None
 
     def _set_hover_item_preview(self, item_key: Any, row: Any) -> None:
         return set_hover_item_preview(self, item_key, row)
@@ -1794,6 +1974,194 @@ class DropViewerWindow:
 
     def _identify_item_for_all_characters(self, item_name: str, rarity: str, rows=None) -> bool:
         return identify_item_for_all_characters(self, item_name, rarity, rows)
+
+    def _refresh_row_stats_now(self, row, force_remote: bool = True) -> bool:
+        if not isinstance(row, list):
+            return False
+        parsed = self._parse_drop_row(row)
+        if parsed is None:
+            return False
+
+        row_sender_email = self._extract_row_sender_email(row)
+        row_player_name = self._ensure_text(parsed.player_name).strip()
+        my_email = self._ensure_text(Player.GetAccountEmail()).strip().lower()
+        my_name = self._ensure_text(Player.GetName()).strip().lower()
+        is_local_row = bool(
+            (my_email and row_sender_email and row_sender_email == my_email)
+            or (my_name and row_player_name and row_player_name.lower() == my_name)
+        )
+        event_id = self._extract_row_event_id(row)
+        if event_id:
+            self._clear_event_stats_cache(event_id, row_sender_email, row_player_name)
+
+        if is_local_row:
+            refreshed = self._ensure_text(self._get_row_stats_text(row)).strip()
+            return bool(refreshed)
+
+        if not force_remote:
+            return False
+        cache_key = self._resolve_stats_cache_key_for_row(row)
+        before_last = float(self.remote_stats_request_last_by_event.get(cache_key, 0.0))
+        self._request_remote_stats_for_row(row, force_refresh=True)
+        after_last = float(self.remote_stats_request_last_by_event.get(cache_key, 0.0))
+        if after_last > before_last:
+            return True
+        pending_last = float(self.remote_stats_pending_by_event.get(cache_key, 0.0))
+        return pending_last > before_last
+
+    def _refresh_item_stats_for_all_characters(self, item_name: str, rarity: str, rows=None) -> bool:
+        pool = rows if rows is not None else self.raw_drops
+        if not pool:
+            self.set_status("Refresh stats failed: no matching rows")
+            return False
+
+        target_rows = []
+        seen_chars = set()
+        for row in reversed(list(pool)):
+            parsed = self._parse_drop_row(row)
+            if parsed is None:
+                continue
+            row_rarity = self._ensure_text(parsed.rarity).strip() or "Unknown"
+            if row_rarity != rarity:
+                continue
+            if not self._item_names_match(item_name, parsed.item_name):
+                continue
+            char_name = self._display_player_name(parsed.player_name, self._extract_row_sender_email(row)).strip()
+            if not char_name:
+                continue
+            char_key = char_name.lower()
+            if char_key in seen_chars:
+                continue
+            seen_chars.add(char_key)
+            target_rows.append(row)
+
+        if not target_rows:
+            self.set_status("Refresh stats failed: no matching characters")
+            return False
+
+        refreshed_count = 0
+        first_row = None
+        for row in target_rows:
+            if self._refresh_row_stats_now(row, force_remote=True):
+                refreshed_count += 1
+                if first_row is None:
+                    first_row = row
+        if first_row is not None:
+            self.selected_log_row = first_row
+
+        total = len(target_rows)
+        if refreshed_count <= 0:
+            self.set_status(f"Refresh stats failed for all characters ({total})")
+            return False
+        if refreshed_count < total:
+            self.set_status(f"Refresh stats sent to {refreshed_count}/{total} characters")
+            return True
+        self.set_status(f"Refresh stats sent to all {total} characters")
+        return True
+
+    def _refresh_selected_row_stats_if_due(self, force: bool = False) -> bool:
+        row = self.selected_log_row if isinstance(self.selected_log_row, list) else None
+        if row is None:
+            return False
+        now_ts = time.time()
+        if not force:
+            if not self.auto_id_enabled:
+                return False
+            interval_s = max(0.8, float(getattr(self, "auto_id_selected_stats_refresh_interval_s", 2.0)))
+            last_ts = float(getattr(self, "auto_id_selected_stats_refresh_last_ts", 0.0) or 0.0)
+            if (now_ts - last_ts) < interval_s:
+                return False
+
+            needs_refresh = True
+            cache_key = self._resolve_stats_cache_key_for_row(row)
+            payload_text = self._get_cached_stats_text(self.stats_payload_by_event, cache_key) if cache_key else ""
+            if payload_text:
+                parsed = self._parse_drop_row(row)
+                rendered = self._render_payload_stats_cached(
+                    cache_key,
+                    payload_text,
+                    self._ensure_text(parsed.item_name) if parsed else "",
+                    owner_name=self._ensure_text(parsed.player_name) if parsed else "",
+                ).strip()
+                if rendered and (not self._stats_text_is_basic(rendered)):
+                    needs_refresh = False
+            else:
+                current_stats = self._ensure_text(self._extract_row_item_stats(row)).strip()
+                if current_stats and (not self._stats_text_is_basic(current_stats)):
+                    needs_refresh = False
+            if not needs_refresh:
+                return False
+
+        refreshed = self._refresh_row_stats_now(row, force_remote=True)
+        self.auto_id_selected_stats_refresh_last_ts = now_ts
+        return refreshed
+
+    def _refresh_auto_id_stats_rows_if_due(self, force: bool = False, max_refresh: int = 2) -> int:
+        rows = self.raw_drops if isinstance(self.raw_drops, list) else []
+        if not rows:
+            return 0
+        if not force and (not self.auto_id_enabled):
+            return 0
+        now_ts = time.time()
+        if not force:
+            interval_s = max(0.5, float(getattr(self, "auto_id_background_stats_refresh_interval_s", 1.0) or 1.0))
+            last_ts = float(getattr(self, "auto_id_background_stats_refresh_last_ts", 0.0) or 0.0)
+            if (now_ts - last_ts) < interval_s:
+                return 0
+
+        selected_rarities = set(self._get_selected_id_rarities() if not force else [])
+        if (not force) and (not selected_rarities):
+            return 0
+
+        row_count = len(rows)
+        if row_count <= 0:
+            return 0
+        refresh_budget = max(1, min(4, int(max_refresh)))
+        scan_budget = min(max(40, refresh_budget * 35), row_count)
+
+        try:
+            idx = int(getattr(self, "auto_id_background_stats_scan_cursor", row_count - 1) or 0)
+        except EXPECTED_RUNTIME_ERRORS:
+            idx = row_count - 1
+        if idx < 0 or idx >= row_count:
+            idx = row_count - 1
+
+        refreshed = 0
+        scanned = 0
+        seen_event_keys: set[str] = set()
+
+        while scanned < scan_budget and refreshed < refresh_budget:
+            row = rows[idx]
+            scanned += 1
+            idx -= 1
+            if idx < 0:
+                idx = row_count - 1
+
+            parsed = self._parse_drop_row(row)
+            if parsed is None:
+                continue
+            rarity = self._ensure_text(parsed.rarity).strip() or "Unknown"
+            if (not force) and (rarity not in selected_rarities):
+                continue
+
+            event_id = self._extract_row_event_id(row)
+            sender_email = self._extract_row_sender_email(row)
+            event_key = f"{sender_email}:{event_id}".lower() if event_id else ""
+            if event_key and event_key in seen_event_keys:
+                continue
+
+            current_stats = self._ensure_text(self._extract_row_item_stats(row)).strip()
+            if current_stats and (not self._stats_text_is_basic(current_stats)):
+                continue
+
+            if self._refresh_row_stats_now(row, force_remote=True):
+                refreshed += 1
+                if event_key:
+                    seen_event_keys.add(event_key)
+
+        self.auto_id_background_stats_scan_cursor = idx
+        self.auto_id_background_stats_refresh_last_ts = now_ts
+        return int(refreshed)
 
     def _collect_selected_item_stats(self, item_key=None):
         return collect_selected_item_stats(self, item_key)
@@ -1971,6 +2339,21 @@ class DropViewerWindow:
 
     def _get_inventory_snapshot(self):
         return get_inventory_snapshot(self)
+
+    def _get_nearby_merchant_candidate_agent_ids(self) -> list[int]:
+        return get_nearby_merchant_candidate_agent_ids(self)
+
+    def _find_nearby_merchant_agent_id(self) -> int:
+        return find_nearby_merchant_agent_id(self)
+
+    def _is_merchant_frame_open(self) -> bool:
+        return is_merchant_frame_open(self)
+
+    def _handle_lions_arch_merchant_dialog_if_visible(self) -> bool:
+        return handle_lions_arch_merchant_dialog_if_visible(self)
+
+    def _get_offered_merchant_items(self) -> list[int]:
+        return get_offered_merchant_items(self)
 
     def _find_merchant_item_by_model(self, model_id: int) -> int:
         return find_merchant_item_by_model(self, model_id)
@@ -2230,6 +2613,7 @@ def main():
 def draw_window():
     viewer = _maybe_refresh_drop_viewer() or drop_viewer
     try:
+        viewer._mark_update_invocation("draw_window")
         viewer.update()
         viewer.draw()
     except Exception as e:
@@ -2246,6 +2630,7 @@ def draw_window():
 def update():
     viewer = _maybe_refresh_drop_viewer() or drop_viewer
     try:
+        viewer._mark_update_invocation("update")
         viewer.update()
     except Exception as e:
         try:

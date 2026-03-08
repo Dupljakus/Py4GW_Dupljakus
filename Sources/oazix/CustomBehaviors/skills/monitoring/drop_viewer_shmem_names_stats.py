@@ -69,6 +69,37 @@ def _compact_name_keys_overlap(compact_rows: set[str], compact_candidates: set[s
     return False
 
 
+def _rendered_head_matches_row_names(viewer, row_names: list[str], rendered_head: str) -> bool:
+    normalized_rows = {
+        viewer._normalize_item_name(value)
+        for value in list(row_names or [])
+        if viewer._clean_item_name(value).strip()
+    }
+    normalized_rows.discard("")
+    compact_rows = {
+        _compact_item_name_key(viewer, value)
+        for value in list(row_names or [])
+        if viewer._clean_item_name(value).strip()
+    }
+    compact_rows = {value for value in compact_rows if value}
+    if not normalized_rows and not compact_rows:
+        return False
+    for raw_line in viewer._ensure_text(rendered_head).splitlines():
+        line_txt = viewer._clean_item_name(raw_line).strip()
+        if not line_txt or line_txt.lower() == "unidentified":
+            continue
+        normalized_line = viewer._normalize_item_name(line_txt)
+        if normalized_line and normalized_line in normalized_rows:
+            return True
+        compact_line = _compact_item_name_key(viewer, line_txt)
+        if compact_line and any(
+            compact_line == row_name or compact_line in row_name or row_name in compact_line
+            for row_name in compact_rows
+        ):
+            return True
+    return False
+
+
 def _append_stats_name_mismatch_debug_log(
     viewer,
     *,
@@ -115,6 +146,8 @@ def _append_stats_name_mismatch_debug_log(
         compact_rows = {value for value in compact_rows if value}
         if _compact_name_keys_overlap(set(compact_rows), set(compact_candidates)):
             return
+    if _rendered_head_matches_row_names(viewer, row_names, rendered_head):
+        return
     _append_stats_binding_debug_log(
         viewer,
         "viewer_stats_name_mismatch",

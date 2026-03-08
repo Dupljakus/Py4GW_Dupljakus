@@ -258,18 +258,20 @@ def process_tracker_drop_message(
         mark_seen_event(viewer.seen_events, event_key, now_ts)
 
     if not is_duplicate:
-        batch_rows.append(
-            {
-                "player_name": sender_name,
-                "item_name": item_name,
-                "quantity": quantity,
-                "extra_info": exact_rarity,
-                "timestamp_override": None,
-                "event_id": event_id,
-                "item_stats": stats_text,
-                "item_id": row_item_id,
-                "sender_email": sender_email,
-            }
+        viewer._log_drops_batch(
+            [
+                {
+                    "player_name": sender_name,
+                    "item_name": item_name,
+                    "quantity": quantity,
+                    "extra_info": exact_rarity,
+                    "timestamp_override": None,
+                    "event_id": event_id,
+                    "item_stats": stats_text,
+                    "item_id": row_item_id,
+                    "sender_email": sender_email,
+                }
+            ]
         )
         viewer._log_name_trace(
             (

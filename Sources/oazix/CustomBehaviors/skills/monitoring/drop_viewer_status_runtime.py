@@ -24,23 +24,28 @@ def set_status(viewer, msg):
     viewer.status_time = time.time()
 
 
-def set_paused(viewer, paused: bool):
+def arm_chat_history_catchup(viewer):
     player = _runtime_attr(viewer, "Player")
     expected_errors = _runtime_attr(viewer, "EXPECTED_RUNTIME_ERRORS", EXPECTED_RUNTIME_ERRORS)
 
+    viewer.chat_requested = False
+    viewer.last_chat_index = -1
+    viewer.chat_bootstrap_floor_index = -1
+    try:
+        if player is not None and player.IsChatHistoryReady():
+            viewer.chat_bootstrap_floor_index = len(player.GetChatHistory())
+    except expected_errors:
+        viewer.chat_bootstrap_floor_index = -1
+
+
+def set_paused(viewer, paused: bool):
     next_state = bool(paused)
     if bool(viewer.paused) == next_state:
         return
     viewer.paused = next_state
     # Avoid replaying stale chat lines when transitioning tracking state.
-    viewer.chat_requested = False
     if not viewer.paused:
-        viewer.last_chat_index = -1
-        try:
-            if player.IsChatHistoryReady():
-                viewer.last_chat_index = len(player.GetChatHistory())
-        except expected_errors:
-            viewer.last_chat_index = -1
+        arm_chat_history_catchup(viewer)
 
 
 def toggle_follower_inventory_viewer(viewer):

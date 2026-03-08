@@ -1,4 +1,5 @@
 import sys
+import time
 
 from Py4GWCoreLib import Py4GW, Routines
 
@@ -46,9 +47,48 @@ def run_sender_tick(sender) -> None:
                     current_instance_uptime_ms=current_instance_uptime_ms,
                 )
                 if transition_reason:
+                    sender.pending_reset_origin = "sender_tick"
+                    sender.pending_reset_source_runtime_id = str(getattr(sender, "sender_runtime_id", "") or "")
+                    sender.pending_reset_source_caller = "run_sender_tick"
+                    sender.pending_reset_source_sequence = int(getattr(sender, "sender_tick_sequence", 0) or 0)
                     sender._begin_new_session(transition_reason, current_map_id, current_instance_uptime_ms)
+                    if (
+                        transition_reason in {"instance_change", "viewer_sync_reset"}
+                        and bool(getattr(sender, "session_startup_pending", False))
+                        and bool(getattr(sender, "carryover_inventory_snapshot", {}))
+                    ):
+                        sender._append_live_debug_log(
+                            "sender_post_reset_scan_scheduled",
+                            f"transition={transition_reason}",
+                            transition_reason=str(transition_reason or "").strip(),
+                            carryover_count=len(getattr(sender, "carryover_inventory_snapshot", {}) or {}),
+                            current_map_id=int(current_map_id or 0),
+                            current_instance_uptime_ms=int(current_instance_uptime_ms or 0),
+                        )
+                        sender._process_inventory_deltas()
+                        if sender.outbox_queue:
+                            sender._flush_outbox()
+                        if sender.pending_name_refresh_by_event:
+                            sender._process_pending_name_refreshes()
                     return
             sender.last_seen_instance_uptime_ms = current_instance_uptime_ms
+        sender.sender_tick_sequence = int(getattr(sender, "sender_tick_sequence", 0) or 0) + 1
+        now_ts = time.time()
+        heartbeat_interval_s = max(1.0, float(getattr(sender, "heartbeat_interval_s", 2.5) or 2.5))
+        last_heartbeat_log_at = float(getattr(sender, "last_heartbeat_log_at", 0.0) or 0.0)
+        if (now_ts - last_heartbeat_log_at) >= heartbeat_interval_s:
+            sender.last_heartbeat_log_at = now_ts
+            sender._append_live_debug_log(
+                "sender_runtime_heartbeat",
+                f"map={int(current_map_id or 0)} uptime_ms={int(current_instance_uptime_ms or 0)}",
+                current_map_id=int(current_map_id or 0),
+                current_instance_uptime_ms=int(current_instance_uptime_ms or 0),
+                snapshot_size=len(getattr(sender, "last_inventory_snapshot", {}) or {}),
+                pending_outbox_count=len(getattr(sender, "outbox_queue", []) or []),
+                pending_name_refresh_count=len(getattr(sender, "pending_name_refresh_by_event", {}) or {}),
+                log_path=str(getattr(sender, "runtime_config_path", "") or "").strip(),
+                live_debug_log_path=str(getattr(sender, "live_debug_log_path", "") or "").strip(),
+            )
         if sender.config_poll_timer.IsExpired():
             sender.config_poll_timer.Reset()
             sender._load_runtime_config()

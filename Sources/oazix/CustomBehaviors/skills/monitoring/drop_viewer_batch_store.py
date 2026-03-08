@@ -13,8 +13,24 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_models import 
 EXPECTED_RUNTIME_ERRORS = (TypeError, ValueError, RuntimeError, AttributeError, IndexError, KeyError, OSError)
 
 
+def _safe_int_local(viewer, value, default=0) -> int:
+    safe_int = getattr(viewer, "_safe_int", None)
+    if callable(safe_int):
+        return int(safe_int(value, default))
+    try:
+        return int(value)
+    except EXPECTED_RUNTIME_ERRORS:
+        return int(default)
+
+
 def rebuild_live_state_from_log(viewer) -> None:
     parsed_rows = parse_drop_log_file(viewer.log_path, map_name_resolver=Map.GetMapName)
+    floor_row_count = max(0, _safe_int_local(viewer, getattr(viewer, "live_session_log_floor_row_count", 0), 0))
+    if floor_row_count > 0:
+        if len(parsed_rows) <= floor_row_count:
+            parsed_rows = []
+        else:
+            parsed_rows = parsed_rows[floor_row_count:]
     temp_drops, temp_agg, total, temp_stats_by_event = build_state_from_parsed_rows(
         parsed_rows=parsed_rows,
         ensure_text_fn=viewer._ensure_text,
@@ -25,6 +41,9 @@ def rebuild_live_state_from_log(viewer) -> None:
     viewer.aggregated_drops = temp_agg
     viewer.total_drops = int(total)
     viewer.stats_by_event = temp_stats_by_event
+    mark_rows_changed = getattr(viewer, "_mark_rows_changed", None)
+    if callable(mark_rows_changed):
+        mark_rows_changed("rebuild_live_state_from_log")
 
 
 def log_drop_to_file(
@@ -66,6 +85,7 @@ def log_drops_batch(viewer, entries) -> None:
         for entry in entries:
             drop_rows.append(viewer._build_drop_log_row_from_entry(entry, bot_name, map_id, map_name))
         append_drop_log_rows(viewer.log_path, drop_rows)
+        rows_changed = False
         try:
             temp_drops, temp_agg, total, temp_stats_by_event = append_drop_rows_to_state(
                 drop_rows=drop_rows,
@@ -81,10 +101,17 @@ def log_drops_batch(viewer, entries) -> None:
             viewer.aggregated_drops = temp_agg
             viewer.total_drops = int(total)
             viewer.stats_by_event = temp_stats_by_event
+            rows_changed = bool(drop_rows)
             if drop_rows and (not isinstance(viewer.raw_drops, list) or len(viewer.raw_drops) <= 0 or int(viewer.total_drops) <= 0):
                 rebuild_live_state_from_log(viewer)
+                rows_changed = True
         except EXPECTED_RUNTIME_ERRORS:
             rebuild_live_state_from_log(viewer)
+            rows_changed = True
+        if rows_changed:
+            mark_rows_changed = getattr(viewer, "_mark_rows_changed", None)
+            if callable(mark_rows_changed):
+                mark_rows_changed("log_drops_batch")
         viewer.last_read_time = os.path.getmtime(viewer.log_path) if os.path.exists(viewer.log_path) else time.time()
     except EXPECTED_RUNTIME_ERRORS as e:
         Py4GW.Console.Log("DropViewer", f"Log Error: {e}", Py4GW.Console.MessageType.Warning)

@@ -6,32 +6,35 @@ import os
 from typing import Any
 
 from Sources.oazix.CustomBehaviors.primitives import constants
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_diagnostics_sink import (
+    append_diagnostics_event_jsonl,
+    get_diagnostics_log_path,
+)
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_event_schema import (
+    EVENT_BASE_FIELDS as _EVENT_BASE_FIELDS,
+)
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_event_schema import normalize_event_field_value
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_event_schema import normalize_parsed_event_payload
 
 EXPECTED_RUNTIME_ERRORS = (TypeError, ValueError, RuntimeError, AttributeError, IndexError, KeyError, OSError)
 _LAST_EMIT_BY_KEY: dict[str, float] = {}
-_LIVE_DEBUG_BASE_FIELDS = {"ts", "actor", "event", "message"}
+_LIVE_DEBUG_BASE_FIELDS = set(_EVENT_BASE_FIELDS)
+_RESERVED_SINK_FIELD_NAMES = {"actor", "event", "message", "drop_log_path", "log_path", "ts"}
+
+
+def _sanitize_live_debug_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for raw_key, raw_value in fields.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        safe_key = f"payload_{key}" if key in _RESERVED_SINK_FIELD_NAMES else key
+        sanitized[safe_key] = normalize_event_field_value(raw_value)
+    return sanitized
 
 
 def get_live_debug_log_path(drop_log_path: str = "") -> str:
-    base_path = str(drop_log_path or constants.DROP_LOG_PATH or "").strip()
-    if not base_path:
-        base_path = "Py4GW/drop_log.csv"
-    return os.path.join(os.path.dirname(base_path), "drop_tracker_live_debug.jsonl")
-
-
-def _normalize_field_value(value: Any):
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, tuple):
-        return [_normalize_field_value(part) for part in value]
-    if isinstance(value, list):
-        return [_normalize_field_value(part) for part in value]
-    if isinstance(value, dict):
-        normalized = {}
-        for key, item in value.items():
-            normalized[str(key)] = _normalize_field_value(item)
-        return normalized
-    return str(value)
+    return get_diagnostics_log_path(drop_log_path, file_name="drop_tracker_live_debug.jsonl")
 
 
 def _tail_read_text_lines(path: str, max_lines: int) -> list[str]:
@@ -76,25 +79,7 @@ def parse_live_debug_line(raw_line: Any) -> dict[str, Any] | None:
             "event": "raw",
             "message": line,
         }
-    if not isinstance(payload, dict):
-        payload = {
-            "ts": "",
-            "actor": "raw",
-            "event": "raw",
-            "message": line,
-        }
-    normalized: dict[str, Any] = {
-        "ts": str(payload.get("ts", "") or "").strip(),
-        "actor": str(payload.get("actor", "") or "").strip() or "unknown",
-        "event": str(payload.get("event", "") or "").strip() or "log",
-        "message": str(payload.get("message", "") or "").strip(),
-    }
-    for key, value in payload.items():
-        key_txt = str(key or "").strip()
-        if not key_txt or key_txt in _LIVE_DEBUG_BASE_FIELDS:
-            continue
-        normalized[key_txt] = _normalize_field_value(value)
-    return normalized
+    return normalize_parsed_event_payload(payload)
 
 
 def format_live_debug_record(payload: Any, max_extra_fields: int = 6) -> str:
@@ -201,22 +186,14 @@ def append_live_debug_log(
                 stale_keys = sorted(_LAST_EMIT_BY_KEY.items(), key=lambda item: float(item[1]))[:2000]
                 for stale_key, _ in stale_keys:
                     _LAST_EMIT_BY_KEY.pop(stale_key, None)
-        target_path = get_live_debug_log_path(drop_log_path)
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        payload: dict[str, Any] = {
-            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-            "actor": str(actor or "").strip() or "unknown",
-            "event": str(event or "").strip() or "log",
-            "message": str(message or "").strip(),
-        }
-        for key, value in fields.items():
-            key_txt = str(key or "").strip()
-            if not key_txt:
-                continue
-            payload[key_txt] = _normalize_field_value(value)
-        with open(target_path, mode="a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
-        return target_path
+        return append_diagnostics_event_jsonl(
+            actor=str(actor or "").strip() or "unknown",
+            event=str(event or "").strip() or "log",
+            message=str(message or "").strip(),
+            drop_log_path=drop_log_path,
+            ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            **_sanitize_live_debug_fields(fields),
+        )
     except EXPECTED_RUNTIME_ERRORS:
         return ""
 

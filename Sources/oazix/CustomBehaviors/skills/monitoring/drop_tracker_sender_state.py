@@ -229,6 +229,7 @@ def reset_tracking_state(sender, clear_outbox: bool = True):
     sender.last_ack_count = 0
     sender.last_process_duration_ms = 0.0
     sender.last_inventory_activity_ts = 0.0
+    sender.startup_stable_snapshot_credit = 0
     sender.pending_name_refresh_by_event = {}
     sender.sent_event_stats_cache = {}
     if clear_outbox:

@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from Sources.oazix.CustomBehaviors.tests import drop_test_reporting as reporting
+
 try:
     from Sources.oazix.CustomBehaviors.tests import (
         drop_tracker_live_test_harness as harness,
@@ -15,58 +17,20 @@ except ImportError:
 
 
 def _default_oracle_policy() -> dict[str, Any]:
-    return {
-        "max_send_failed_count": 0,
-        "max_missing_in_csv": 0,
-        "max_latest_session_missing_in_csv": 0,
-        "max_missing_in_accepted": 0,
-        "max_duplicate_csv_event_ids": 0,
-        "max_suspicious_name_update_count": 0,
-        "max_stats_name_mismatch_count": 0,
-        "max_invalid_target_count": 0,
-        "max_forbidden_row_count": 0,
-        "max_lifecycle_gap_count": 0,
-        "max_accepted_missing_stats_binding_count": 0,
-        "warn_duplicate_event_count_above": 0,
-        "warn_suppressed_event_count_above": 0,
-        "warn_reset_event_count_above": 0,
-        "warn_duplicate_drop_rows_above": 0,
-    }
+    return reporting.default_oracle_policy()
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return int(default)
+    return reporting.safe_int(value, default)
 
 
 def _load_oracle_policy() -> dict[str, Any]:
-    policy = dict(_default_oracle_policy())
     path_value = getattr(harness, "ORACLE_POLICY_PATH", None)
-    if path_value is None:
-        return policy
     try:
-        path = Path(path_value)
+        path = Path(path_value) if path_value is not None else None
     except (TypeError, ValueError):
-        return policy
-    try:
-        if not path.exists():
-            return policy
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if not isinstance(payload, dict):
-            return policy
-    except OSError:
-        return policy
-    except json.JSONDecodeError:
-        return policy
-
-    for key, default_value in policy.items():
-        if key not in payload:
-            continue
-        policy[key] = _safe_int(payload.get(key, default_value), int(default_value))
-    return policy
+        path = None
+    return reporting.load_oracle_policy(path)
 
 
 def assess_summary(summary: dict[str, Any], policy: dict[str, Any] | None = None) -> tuple[bool, list[str], list[str]]:
@@ -88,10 +52,16 @@ def assess_summary(summary: dict[str, Any], policy: dict[str, Any] | None = None
     duplicate_event_count = int(summary.get("duplicate_event_count", 0) or 0)
     suppressed_event_count = int(summary.get("suppressed_event_count", 0) or 0)
     reset_event_count = int(summary.get("reset_event_count", 0) or 0)
+    reset_runtime_count = int(summary.get("reset_runtime_count", 0) or 0)
+    max_reset_events_per_runtime = int(summary.get("max_reset_events_per_runtime", 0) or 0)
+    recovered_send_failed_count = int(summary.get("send_failed_recovered_count", 0) or 0)
     rezone_count = int(summary.get("rezone_count", 0) or 0)
     forbidden_row_count = int(summary.get("forbidden_row_count", 0) or 0)
     lifecycle_gap_count = int(summary.get("lifecycle_gap_count", 0) or 0)
     accepted_missing_stats_binding_count = int(summary.get("accepted_missing_stats_binding_count", 0) or 0)
+    chat_pickup_count = int(summary.get("chat_pickup_count", 0) or 0)
+    uncorrelated_chat_pickup_count = int(summary.get("uncorrelated_chat_pickup_count", 0) or 0)
+    chat_item_tracking_enabled = bool(summary.get("chat_item_tracking_enabled", False))
 
     if send_failed_count > int(config.get("max_send_failed_count", 0) or 0):
         failures.append(f"Transport failed for {send_failed_count} tracker send attempt(s).")
@@ -118,16 +88,43 @@ def assess_summary(summary: dict[str, Any], policy: dict[str, Any] | None = None
             f"{accepted_missing_stats_binding_count} accepted drop(s) are missing bound stats."
         )
     if accepted_count == 0 and new_drop_rows == 0:
-        failures.append("No tracked drops were captured during the test window.")
+        if bool(summary.get("window_ended_before_post_reset_sender_cycle", False)):
+            failures.append("No tracked drops were captured; the test window ended before any post-reset sender cycle ran.")
+        elif bool(summary.get("window_ended_during_sender_startup", False)):
+            failures.append("No tracked drops were captured; the test window ended during sender startup after reset.")
+        elif bool(summary.get("runtime_log_silent_after_reset", False)):
+            failures.append("No tracked drops were captured; the analyzed runtime log went silent after reset.")
+        elif uncorrelated_chat_pickup_count > 0:
+            failures.append(
+                f"{uncorrelated_chat_pickup_count} chat pickup(s) were observed without any tracked sender/viewer event."
+            )
+        else:
+            failures.append("No tracked drops were captured during the test window.")
+    elif uncorrelated_chat_pickup_count > 0:
+        failures.append(
+            f"{uncorrelated_chat_pickup_count} chat pickup(s) were observed without any tracked sender/viewer event."
+        )
 
     if duplicate_event_count > int(config.get("warn_duplicate_event_count_above", 0) or 0):
         warnings.append(f"{duplicate_event_count} duplicate viewer event(s) were observed.")
     if suppressed_event_count > int(config.get("warn_suppressed_event_count_above", 0) or 0):
         warnings.append(f"{suppressed_event_count} candidate suppression event(s) were observed.")
     if reset_event_count > int(config.get("warn_reset_event_count_above", 0) or 0):
-        warnings.append(f"{reset_event_count} session reset event(s) occurred during the run.")
+        if reset_runtime_count > 1:
+            warnings.append(
+                f"{reset_event_count} session reset event(s) occurred across {reset_runtime_count} runtimes "
+                f"(max {max_reset_events_per_runtime} on one runtime)."
+            )
+        else:
+            warnings.append(f"{reset_event_count} session reset event(s) occurred during the run.")
     if len(duplicate_drop_rows) > int(config.get("warn_duplicate_drop_rows_above", 0) or 0):
         warnings.append(f"{len(duplicate_drop_rows)} repeated loot-table label(s) were observed.")
+    if recovered_send_failed_count > 0:
+        warnings.append(f"{recovered_send_failed_count} tracker send failure(s) recovered on retry.")
+    if chat_pickup_count > 0 and uncorrelated_chat_pickup_count == 0:
+        warnings.append(f"{chat_pickup_count} chat pickup(s) correlated with tracked events.")
+    if not chat_item_tracking_enabled and accepted_count == 0 and new_drop_rows == 0:
+        warnings.append("Pickup Watch was OFF for this run; missing chat pickup rows are not evidence that pickups did not happen.")
 
     return not failures, failures, warnings
 
@@ -181,7 +178,15 @@ def format_report(summary: dict[str, Any]) -> str:
     if send_failed_events:
         lines.append("Recent Send Failures:")
         for row in send_failed_events[:5]:
-            item_name = str(row.get("item_name", "") or "Unknown Item").strip()
+            item_name = str(row.get("label", "") or row.get("item_name", "") or "Unknown Item").strip()
+            receiver = str(row.get("receiver_email", "") or "Unknown Receiver").strip()
+            lines.append(f"- {item_name} -> {receiver}")
+
+    recovered_send_failed_events = list(summary.get("send_failed_recovered_events", []))
+    if recovered_send_failed_events:
+        lines.append("Recovered Send Retries:")
+        for row in recovered_send_failed_events[:5]:
+            item_name = str(row.get("label", "") or row.get("item_name", "") or "Unknown Item").strip()
             receiver = str(row.get("receiver_email", "") or "Unknown Receiver").strip()
             lines.append(f"- {item_name} -> {receiver}")
 
@@ -297,6 +302,36 @@ def format_report(summary: dict[str, Any]) -> str:
             reasons = ",".join(str(value or "").strip() for value in list(row.get("reasons", []) or []) if str(value or "").strip())
             lines.append(f"- map={map_id} uptime_ms={uptime_ms} ts={ts_value} reasons={reasons or 'unknown'}")
 
+    reset_runtime_breakdown = list(summary.get("reset_runtime_breakdown", []))
+    if reset_runtime_breakdown:
+        lines.append("Reset Distribution:")
+        for row in reset_runtime_breakdown[:8]:
+            actor = str(row.get("actor", "") or "").strip() or "unknown"
+            runtime_id = str(row.get("runtime_id", "") or "").strip() or "unknown-runtime"
+            count = int(row.get("count", 0) or 0)
+            latest_reason = str(row.get("latest_reason", "") or "").strip() or "unknown"
+            latest_caller = str(row.get("latest_caller", "") or "").strip()
+            extra = f" latest_reason={latest_reason}"
+            if latest_caller:
+                extra += f" caller={latest_caller}"
+            lines.append(f"- {actor} {runtime_id}: count={count}{extra}")
+
+    noise_cost_summary = dict(summary.get("noise_cost_summary", {}) or {})
+    if noise_cost_summary:
+        assessment = str(noise_cost_summary.get("assessment", "") or "").strip()
+        viewer_count = int(noise_cost_summary.get("viewer_reset_perf_count", 0) or 0)
+        viewer_avg_ms = float(noise_cost_summary.get("viewer_reset_perf_avg_ms", 0.0) or 0.0)
+        viewer_max_ms = float(noise_cost_summary.get("viewer_reset_perf_max_ms", 0.0) or 0.0)
+        sender_count = int(noise_cost_summary.get("sender_noise_perf_count", 0) or 0)
+        sender_avg_ms = float(noise_cost_summary.get("sender_noise_perf_avg_ms", 0.0) or 0.0)
+        sender_max_ms = float(noise_cost_summary.get("sender_noise_perf_max_ms", 0.0) or 0.0)
+        lines.append("Noise Cost:")
+        lines.append(
+            f"- assessment={assessment or 'unknown'} "
+            f"viewer_reset_perf=count={viewer_count} avg_ms={viewer_avg_ms:.2f} max_ms={viewer_max_ms:.2f} "
+            f"sender_noise_perf=count={sender_count} avg_ms={sender_avg_ms:.2f} max_ms={sender_max_ms:.2f}"
+        )
+
     return "\n".join(lines)
 
 
@@ -340,55 +375,16 @@ def _write_bug_bundle_if_failed(
     new_debug_rows: list[dict[str, Any]],
     policy: dict[str, Any],
 ) -> str:
-    passed, failures, warnings = assess_summary(summary, policy)
-    if passed:
-        return ""
-
-    focus_event_ids = set(_extract_focus_event_ids(summary))
-    if focus_event_ids:
-        related_drop_rows = [
-            row
-            for row in list(new_drop_rows or [])
-            if str(row.get("EventID", "") or "").strip() in focus_event_ids
-        ]
-        related_debug_rows = [
-            row
-            for row in list(new_debug_rows or [])
-            if str(row.get("event_id", "") or "").strip() in focus_event_ids
-        ]
-    else:
-        related_drop_rows = list(new_drop_rows or [])[:80]
-        related_debug_rows = list(new_debug_rows or [])[:200]
-
-    bundle_payload = {
-        "generated_at_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "failures": failures,
-        "warnings": warnings,
-        "policy": policy,
-        "focus_event_ids": sorted(focus_event_ids),
-        "summary": summary,
-        "baseline_state": state,
-        "related_drop_rows": related_drop_rows[:240],
-        "related_debug_rows": related_debug_rows[:500],
-    }
-
-    bundle_dir = _bundle_dir_path()
-    try:
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return ""
-
-    bundle_name = f"bundle_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.json"
-    bundle_path = bundle_dir / bundle_name
-    latest_path = bundle_dir / "latest.json"
-    try:
-        with bundle_path.open("w", encoding="utf-8") as handle:
-            json.dump(bundle_payload, handle, indent=2)
-        with latest_path.open("w", encoding="utf-8") as handle:
-            json.dump(bundle_payload, handle, indent=2)
-    except OSError:
-        return ""
-    return str(bundle_path)
+    return reporting.write_bug_bundle_if_failed(
+        summary=summary,
+        state=state,
+        new_drop_rows=new_drop_rows,
+        new_debug_rows=new_debug_rows,
+        policy=policy,
+        bundle_dir=_bundle_dir_path(),
+        assess_fn=assess_summary,
+        extract_focus_event_ids_fn=_extract_focus_event_ids,
+    )
 
 
 def _end() -> int:

@@ -10,7 +10,28 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_batch_store imp
 def set_row_item_stats(viewer, row: Any, item_stats: str) -> None:
     from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_row_ops import set_runtime_row_item_stats
 
-    set_runtime_row_item_stats(row, viewer._ensure_text(item_stats).strip())
+    if not isinstance(row, list):
+        return
+    incoming_text = viewer._ensure_text(item_stats).strip()
+    existing_text = ""
+    if len(row) > 9:
+        existing_text = viewer._ensure_text(row[9]).strip()
+    normalize_stats = getattr(viewer, "_normalize_stats_text", None)
+    if callable(normalize_stats):
+        try:
+            existing_normalized = viewer._ensure_text(normalize_stats(existing_text)).strip()
+            incoming_normalized = viewer._ensure_text(normalize_stats(incoming_text)).strip()
+        except (TypeError, ValueError, RuntimeError, AttributeError):
+            existing_normalized = existing_text
+            incoming_normalized = incoming_text
+    else:
+        existing_normalized = existing_text
+        incoming_normalized = incoming_text
+    if existing_normalized == incoming_normalized:
+        if existing_text != incoming_text:
+            set_runtime_row_item_stats(row, incoming_text)
+        return
+    set_runtime_row_item_stats(row, incoming_text)
     persist_runtime_row_to_file(viewer, row)
 
 

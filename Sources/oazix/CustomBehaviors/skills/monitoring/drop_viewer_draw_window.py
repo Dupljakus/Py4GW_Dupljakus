@@ -2,6 +2,11 @@ import os
 import sys
 import time
 
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_viewer_alerts import (
+    begin_selected_name_mismatch_popup,
+    dismiss_selected_name_mismatch_popup,
+    selected_name_mismatch_popup_remaining,
+)
 
 EXPECTED_RUNTIME_ERRORS = (TypeError, ValueError, RuntimeError, AttributeError, IndexError, KeyError, OSError)
 
@@ -169,24 +174,22 @@ def _draw_main_gui(viewer, pyimgui, imgui, map_api, player_api, py4gw_api):
                 pyimgui.close_current_popup()
             pyimgui.end_popup_modal()
 
-        if bool(getattr(viewer, "selected_name_mismatch_popup_pending", False)):
+        if begin_selected_name_mismatch_popup(viewer):
             pyimgui.open_popup("SelectedNameMismatchAlert")
-            viewer.selected_name_mismatch_popup_pending = False
-        selected_name_mismatch_popup_until = float(getattr(viewer, "selected_name_mismatch_popup_until", 0.0) or 0.0)
         if pyimgui.begin_popup_modal("SelectedNameMismatchAlert", True, pyimgui.WindowFlags.AlwaysAutoResize):
             pyimgui.text_colored("Selected Item Mismatch", (1.0, 0.58, 0.24, 1.0))
             pyimgui.separator()
             popup_msg = viewer._ensure_text(getattr(viewer, "selected_name_mismatch_popup_message", "")).strip()
             if popup_msg:
                 pyimgui.text_wrapped(popup_msg)
-            remaining_s = max(0.0, selected_name_mismatch_popup_until - time.time())
+            remaining_s = selected_name_mismatch_popup_remaining(viewer)
             pyimgui.separator()
             pyimgui.text_colored(f"Closing in {remaining_s:.1f}s", (0.78, 0.78, 0.78, 1.0))
             if remaining_s <= 0.0:
-                viewer.selected_name_mismatch_popup_until = 0.0
+                dismiss_selected_name_mismatch_popup(viewer)
                 pyimgui.close_current_popup()
             elif viewer._styled_button("Close", "secondary"):
-                viewer.selected_name_mismatch_popup_until = 0.0
+                dismiss_selected_name_mismatch_popup(viewer)
                 pyimgui.close_current_popup()
             pyimgui.end_popup_modal()
 
@@ -197,9 +200,7 @@ def _draw_main_gui(viewer, pyimgui, imgui, map_api, player_api, py4gw_api):
                 current_instance_uptime_ms = max(0, viewer._safe_int(map_api.GetInstanceUptime(), 0))
                 viewer._reset_sender_tracking_session(current_map_id, current_instance_uptime_ms)
                 viewer._reset_live_session()
-                viewer.last_chat_index = -1
-                if player_api.IsChatHistoryReady():
-                    viewer.last_chat_index = len(player_api.GetChatHistory())
+                viewer._arm_chat_history_catchup()
                 viewer.set_status("Log Cleared")
             except EXPECTED_RUNTIME_ERRORS as e:
                 if py4gw_api is not None:
@@ -207,7 +208,7 @@ def _draw_main_gui(viewer, pyimgui, imgui, map_api, player_api, py4gw_api):
 
         filtered_rows = viewer._get_filtered_rows()
         viewer._clear_hover_item_preview()
-        table_rows = filtered_rows
+        table_rows = viewer._get_table_rows(filtered_rows, viewer.view_mode)
         viewer._draw_summary_bar(filtered_rows)
         viewer._draw_top_control_strip()
         viewer._draw_live_status_chips()
@@ -255,6 +256,9 @@ def _draw_main_gui(viewer, pyimgui, imgui, map_api, player_api, py4gw_api):
                     viewer.hide_gold = pyimgui.checkbox("Hide Gold", viewer.hide_gold)
                     viewer.min_qty = max(1, int(pyimgui.input_int("Min Qty", int(viewer.min_qty))))
                     viewer.auto_scroll = pyimgui.checkbox("Auto Scroll", viewer.auto_scroll)
+                    viewer.log_latest_n_enabled = pyimgui.checkbox("Log Latest N Only", viewer.log_latest_n_enabled)
+                    if viewer.log_latest_n_enabled:
+                        viewer.log_latest_n = max(20, int(pyimgui.input_int("Log Latest N", int(viewer.log_latest_n))))
                     pyimgui.text_colored("Rarity filter moved to the table header.", viewer._ui_colors()["muted"])
                     if viewer._styled_button("Table Top", "secondary", tooltip="Jump table scroll to the top"):
                         viewer._log_table_reset_nonce += 1

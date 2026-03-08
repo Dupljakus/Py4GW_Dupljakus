@@ -373,7 +373,6 @@ def run_auto_inventory_actions_tick(viewer):
                 queued_id = queue_identify_for_rarities(viewer, id_rarities)
                 if queued_id > 0:
                     viewer.set_status(f"Auto ID: queued {queued_id}")
-                    return
 
         if viewer.auto_salvage_enabled and viewer.auto_salvage_timer.IsExpired():
             viewer.auto_salvage_timer.Reset()
@@ -382,6 +381,13 @@ def run_auto_inventory_actions_tick(viewer):
                 queued_salvage = queue_salvage_for_rarities(viewer, salvage_rarities)
                 if queued_salvage > 0:
                     viewer.set_status(f"Auto Salvage: queued {queued_salvage}")
+
+        refresh_selected_stats = getattr(viewer, "_refresh_selected_row_stats_if_due", None)
+        if callable(refresh_selected_stats):
+            refresh_selected_stats(force=False)
+        refresh_background_stats = getattr(viewer, "_refresh_auto_id_stats_rows_if_due", None)
+        if callable(refresh_background_stats):
+            refresh_background_stats(force=False, max_refresh=2)
     except EXPECTED_RUNTIME_ERRORS as e:
         if viewer.verbose_shmem_item_logs and py4gw_api is not None:
             py4gw_api.Console.Log("DropViewer", f"Auto inventory tick failed: {e}", py4gw_api.Console.MessageType.Warning)

@@ -1,6 +1,5 @@
 import os
 import re
-import time
 from typing import Any
 
 from Py4GWCoreLib import GLOBAL_CACHE, Item, Map, Party, Player
@@ -59,7 +58,6 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_tick_runtime i
 from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_sender_state import (
     advance_sender_session_id,
     arm_reset_trace,
-    begin_new_session,
     clear_cached_event_stats,
     clear_cached_event_stats_for_item,
     get_cached_event_identity,
@@ -73,6 +71,13 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_sender_state i
     reset_tracking_state,
     resolve_live_item_id_for_event,
     should_track_name_refresh,
+)
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_session_controller import (
+    begin_sender_tracking_session,
+)
+from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_session_state import (
+    initialize_sender_runtime_state,
+    sync_existing_sender_runtime_state,
 )
 from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_sender_transport import (
     build_stats_fallback_text_for_entry,
@@ -99,6 +104,7 @@ from Sources.oazix.CustomBehaviors.skills.monitoring.drop_tracker_live_debug imp
 )
 
 EXPECTED_RUNTIME_ERRORS = (TypeError, ValueError, RuntimeError, AttributeError, IndexError, KeyError, OSError)
+_SENDER_RUNTIME_GENERATION = int(globals().get("_SENDER_RUNTIME_GENERATION", 0) or 0) + 1
 
 
 class DropTrackerSender:
@@ -117,183 +123,44 @@ class DropTrackerSender:
         return cls._instance
 
     def __init__(self):
+        expected_runtime_config_path = os.path.join(
+            os.path.dirname(constants.DROP_LOG_PATH),
+            "drop_tracker_runtime_config.json",
+        )
+        expected_live_debug_log_path = get_live_debug_log_path(constants.DROP_LOG_PATH)
         if self._initialized:
             # Hot-reload/session safety: if schema/version changed, force a clean baseline.
-            if getattr(self, "state_version", 0) != self._STATE_VERSION:
-                if not hasattr(self, "pending_slot_deltas"):
-                    self.pending_slot_deltas = {}
-                if not hasattr(self, "outbox_queue"):
-                    self.outbox_queue = []
-                if not hasattr(self, "pending_name_refresh_by_event"):
-                    self.pending_name_refresh_by_event = {}
-                if not hasattr(self, "carryover_inventory_snapshot"):
-                    self.carryover_inventory_snapshot = {}
-                if not hasattr(self, "carryover_suppression_until"):
-                    self.carryover_suppression_until = 0.0
-                if not hasattr(self, "stable_snapshot_count"):
-                    self.stable_snapshot_count = 0
-                if not hasattr(self, "session_startup_pending"):
-                    self.session_startup_pending = False
-                if not hasattr(self, "warmup_grace_seconds"):
-                    self.warmup_grace_seconds = 3.0
-                if not hasattr(self, "warmup_grace_until"):
-                    self.warmup_grace_until = 0.0
-                if not hasattr(self, "pending_ttl_seconds"):
-                    self.pending_ttl_seconds = 6.0
-                if not hasattr(self, "debug_pipeline_logs"):
-                    self.debug_pipeline_logs = False
-                if not hasattr(self, "live_debug_detailed"):
-                    self.live_debug_detailed = True
-                if not hasattr(self, "max_outbox_size"):
-                    self.max_outbox_size = 2000
-                if not hasattr(self, "max_snapshot_size_jump"):
-                    self.max_snapshot_size_jump = 40
-                if not hasattr(self, "last_known_is_leader"):
-                    self.last_known_is_leader = False
-                if not hasattr(self, "current_receiver_email"):
-                    self.current_receiver_email = ""
-                if not hasattr(self, "last_reset_reason"):
-                    self.last_reset_reason = ""
-                if not hasattr(self, "last_reset_map_id"):
-                    self.last_reset_map_id = 0
-                if not hasattr(self, "last_reset_instance_uptime_ms"):
-                    self.last_reset_instance_uptime_ms = 0
-                if not hasattr(self, "last_reset_started_at"):
-                    self.last_reset_started_at = 0.0
-                if not hasattr(self, "current_world_item_agents"):
-                    self.current_world_item_agents = {}
-                if not hasattr(self, "recent_world_item_disappearances"):
-                    self.recent_world_item_disappearances = []
-                if not hasattr(self, "world_item_seen_since_reset"):
-                    self.world_item_seen_since_reset = False
-                if not hasattr(self, "world_item_disappearance_ttl_seconds"):
-                    self.world_item_disappearance_ttl_seconds = 5.0
-                if not hasattr(self, "require_world_item_confirmation"):
-                    self.require_world_item_confirmation = True
-                if not hasattr(self, "last_world_item_scan_count"):
-                    self.last_world_item_scan_count = 0
-                if not hasattr(self, "enable_delivery_ack"):
-                    self.enable_delivery_ack = True
-                if not hasattr(self, "retry_interval_seconds"):
-                    self.retry_interval_seconds = 1.0
-                if not hasattr(self, "max_retry_attempts"):
-                    self.max_retry_attempts = 12
-                if not hasattr(self, "enable_perf_logs"):
-                    self.enable_perf_logs = False
-                if not hasattr(self, "event_sequence"):
-                    self.event_sequence = 0
-                if not hasattr(self, "last_seen_map_id"):
-                    self.last_seen_map_id = 0
-                if not hasattr(self, "last_seen_instance_uptime_ms"):
-                    self.last_seen_instance_uptime_ms = 0
-                if not hasattr(self, "sender_session_id"):
-                    self.sender_session_id = 1
-                if not hasattr(self, "last_session_transition_reason"):
-                    self.last_session_transition_reason = ""
-                if not hasattr(self, "runtime_config_path"):
-                    self.runtime_config_path = os.path.join(
-                        os.path.dirname(constants.DROP_LOG_PATH),
-                        "drop_tracker_runtime_config.json",
-                    )
-                if not hasattr(self, "last_inventory_activity_ts"):
-                    self.last_inventory_activity_ts = 0.0
-                if not hasattr(self, "sent_event_stats_cache"):
-                    self.sent_event_stats_cache = {}
-                if not hasattr(self, "sent_event_stats_ttl_seconds"):
-                    self.sent_event_stats_ttl_seconds = 600.0
-                if not hasattr(self, "max_stats_builds_per_tick"):
-                    self.max_stats_builds_per_tick = 2
-                if not hasattr(self, "name_refresh_ttl_seconds"):
-                    self.name_refresh_ttl_seconds = 4.0
-                if not hasattr(self, "name_refresh_poll_interval_seconds"):
-                    self.name_refresh_poll_interval_seconds = 0.25
-                if not hasattr(self, "max_name_refresh_per_tick"):
-                    self.max_name_refresh_per_tick = 4
-                if not hasattr(self, "refresh_stats_after_name_refresh"):
-                    self.refresh_stats_after_name_refresh = True
-                if not hasattr(self, "world_item_poll_timer"):
-                    self.world_item_poll_timer = ThrottledTimer(150)
-                self.debug_enabled = False
-                self.inventory_poll_timer = ThrottledTimer(250)
-                self.state_version = self._STATE_VERSION
-                self._reset_tracking_state()
+            if (
+                getattr(self, "state_version", 0) != self._STATE_VERSION
+                or str(getattr(self, "runtime_config_path", "") or "").strip() != expected_runtime_config_path
+                or str(getattr(self, "live_debug_log_path", "") or "").strip() != expected_live_debug_log_path
+            ):
+                initialize_sender_runtime_state(
+                    self,
+                    state_version=self._STATE_VERSION,
+                    sender_runtime_generation=_SENDER_RUNTIME_GENERATION,
+                )
+                self.gold_regex = re.compile(r"^(?:\[([\d: ]+[ap]m)\] )?Your party shares ([\d,]+) gold\.$")
+                self.warn_timer = ThrottledTimer(3000)
+                self.debug_timer = ThrottledTimer(5000)
+                self.snapshot_error_timer = ThrottledTimer(5000)
+                self._load_mod_database()
+            else:
+                sync_existing_sender_runtime_state(
+                    self,
+                    state_version=self._STATE_VERSION,
+                    sender_runtime_generation=_SENDER_RUNTIME_GENERATION,
+                )
             return
-        self._initialized = True
-        self.state_version = self._STATE_VERSION
-        self.inventory_poll_timer = ThrottledTimer(250)
-        self.world_item_poll_timer = ThrottledTimer(150)
-        self.last_inventory_snapshot: dict[tuple[int, int], tuple[str, str, int, int, int]] = {}
-        self.enabled = True
+        initialize_sender_runtime_state(
+            self,
+            state_version=self._STATE_VERSION,
+            sender_runtime_generation=_SENDER_RUNTIME_GENERATION,
+        )
         self.gold_regex = re.compile(r"^(?:\[([\d: ]+[ap]m)\] )?Your party shares ([\d,]+) gold\.$")
         self.warn_timer = ThrottledTimer(3000)
         self.debug_timer = ThrottledTimer(5000)
         self.snapshot_error_timer = ThrottledTimer(5000)
-        self.debug_enabled = False
-        self.last_snapshot_total = 0
-        self.last_snapshot_ready = 0
-        self.last_snapshot_not_ready = 0
-        self.last_sent_count = 0
-        self.last_candidate_count = 0
-        self.last_enqueued_count = 0
-        self.is_warmed_up = False
-        self.stable_snapshot_count = 0
-        self.pending_slot_deltas: dict[tuple[int, int], dict] = {}
-        self.carryover_inventory_snapshot: dict[tuple[int, int], tuple[str, str, int, int, int]] = {}
-        self.carryover_suppression_until = 0.0
-        self.current_world_item_agents: dict[int, dict[str, Any]] = {}
-        self.recent_world_item_disappearances: list[dict[str, Any]] = []
-        self.world_item_seen_since_reset = False
-        self.world_item_disappearance_ttl_seconds = 5.0
-        self.require_world_item_confirmation = True
-        self.last_world_item_scan_count = 0
-        self.outbox_queue: list[dict] = []
-        self.pending_name_refresh_by_event: dict[str, dict] = {}
-        self.max_send_per_tick = 12
-        self.max_outbox_size = 2000
-        self.max_snapshot_size_jump = 40
-        self.warmup_grace_seconds = 3.0
-        self.warmup_grace_until = 0.0
-        self.session_startup_pending = False
-        self.pending_ttl_seconds = 6.0
-        self.debug_pipeline_logs = False
-        self.live_debug_detailed = True
-        self.last_known_is_leader = False
-        self.current_receiver_email = ""
-        self.last_reset_reason = ""
-        self.last_reset_map_id = 0
-        self.last_reset_instance_uptime_ms = 0
-        self.last_reset_started_at = 0.0
-        self.enable_delivery_ack = True
-        self.retry_interval_seconds = 1.0
-        self.max_retry_attempts = 12
-        self.enable_perf_logs = False
-        self.event_sequence = 0
-        self.last_seen_map_id = 0
-        self.last_seen_instance_uptime_ms = 0
-        self.sender_session_id = 1
-        self.last_session_transition_reason = ""
-        self.last_process_duration_ms = 0.0
-        self.last_ack_count = 0
-        self.last_inventory_activity_ts = 0.0
-        self.sent_event_stats_cache: dict[str, dict] = {}
-        self.sent_event_stats_ttl_seconds = 600.0
-        self.max_stats_builds_per_tick = 2
-        self.name_refresh_ttl_seconds = 4.0
-        self.name_refresh_poll_interval_seconds = 0.25
-        self.max_name_refresh_per_tick = 4
-        self.refresh_stats_after_name_refresh = True
-        self.debug_reset_trace_until = 0.0
-        self.debug_reset_trace_snapshot_logs_remaining = 0
-        self.debug_reset_trace_event_logs_remaining = 0
-        self.debug_reset_trace_lines: list[str] = []
-        self.runtime_config_path = os.path.join(
-            os.path.dirname(constants.DROP_LOG_PATH),
-            "drop_tracker_runtime_config.json",
-        )
-        self.live_debug_log_path = get_live_debug_log_path(constants.DROP_LOG_PATH)
-        self.ack_poll_timer = ThrottledTimer(250)
-        self.config_poll_timer = ThrottledTimer(2000)
-        self.mod_db = None
         self._load_mod_database()
 
     def _load_mod_database(self):
@@ -413,65 +280,18 @@ class DropTrackerSender:
         return advance_sender_session_id(self)
 
     def _begin_new_session(self, reason: str, current_map_id: int = 0, current_instance_uptime_ms: int = 0):
-        normalized_reason = str(reason or "").strip() or "unknown"
-        normalized_map_id = int(current_map_id or 0)
-        normalized_uptime_ms = int(current_instance_uptime_ms or 0)
-        now_ts = time.time()
-        last_reset_reason = str(getattr(self, "last_reset_reason", "") or "").strip()
-        last_reset_map_id = int(getattr(self, "last_reset_map_id", 0) or 0)
-        last_reset_uptime_ms = int(getattr(self, "last_reset_instance_uptime_ms", 0) or 0)
-        last_reset_started_at = float(getattr(self, "last_reset_started_at", 0.0) or 0.0)
-        duplicate_reset = (
-            normalized_reason == last_reset_reason
-            and normalized_map_id > 0
-            and normalized_map_id == last_reset_map_id
-            and (now_ts - last_reset_started_at) <= 3.5
-            and normalized_uptime_ms > 0
-            and last_reset_uptime_ms > 0
-            and abs(normalized_uptime_ms - last_reset_uptime_ms) <= 2500
-        )
-        if duplicate_reset:
-            self.last_seen_map_id = normalized_map_id
-            self.last_seen_instance_uptime_ms = max(last_reset_uptime_ms, normalized_uptime_ms)
-            return
-        existing_carryover_snapshot = (
-            dict(self.carryover_inventory_snapshot)
-            if getattr(self, "carryover_inventory_snapshot", None)
-            else {}
-        )
-        previous_carryover_suppression_until = float(getattr(self, "carryover_suppression_until", 0.0) or 0.0)
-        current_snapshot = dict(self.last_inventory_snapshot) if self.last_inventory_snapshot else {}
-        if existing_carryover_snapshot and current_snapshot:
-            carryover_snapshot = (
-                current_snapshot
-                if len(current_snapshot) >= len(existing_carryover_snapshot)
-                else existing_carryover_snapshot
-            )
-        else:
-            carryover_snapshot = current_snapshot or existing_carryover_snapshot
-        begin_new_session(self, normalized_reason, current_map_id=normalized_map_id, current_instance_uptime_ms=normalized_uptime_ms)
-        self.last_reset_reason = normalized_reason
-        self.last_reset_map_id = normalized_map_id
-        self.last_reset_instance_uptime_ms = normalized_uptime_ms
-        self.last_reset_started_at = now_ts
-        self.carryover_inventory_snapshot = carryover_snapshot
-        self.session_startup_pending = bool(carryover_snapshot)
-        grace_seconds = max(6.0, float(getattr(self, "warmup_grace_seconds", 3.0) or 3.0) + 9.0)
-        next_carryover_suppression_until = time.time() + grace_seconds if carryover_snapshot else 0.0
-        self.carryover_suppression_until = max(previous_carryover_suppression_until, next_carryover_suppression_until)
-        self._append_live_debug_log(
-            "sender_session_reset",
-            f"transition={str(reason or '').strip() or 'unknown'}",
-            reason=str(reason or "").strip() or "unknown",
-            current_map_id=int(current_map_id or 0),
-            current_instance_uptime_ms=int(current_instance_uptime_ms or 0),
-            sender_session_id=int(getattr(self, "sender_session_id", 0) or 0),
-            carryover_count=len(carryover_snapshot),
-            startup_pending=bool(self.session_startup_pending),
-            carryover_suppression_until=float(getattr(self, "carryover_suppression_until", 0.0) or 0.0),
+        return begin_sender_tracking_session(
+            self,
+            reason,
+            current_map_id=current_map_id,
+            current_instance_uptime_ms=current_instance_uptime_ms,
         )
 
     def _append_live_debug_log(self, event: str, message: str, **fields: Any):
+        if "sender_runtime_id" not in fields:
+            fields["sender_runtime_id"] = str(getattr(self, "sender_runtime_id", "") or "")
+        if "sender_runtime_generation" not in fields:
+            fields["sender_runtime_generation"] = int(getattr(self, "sender_runtime_generation", 0) or 0)
         return append_live_debug_log(
             actor="sender",
             event=event,
