@@ -65,7 +65,7 @@ def sync_existing_sender_runtime_state(sender, state_version: int, sender_runtim
     )
     _set_if_missing(sender, "last_inventory_activity_ts", 0.0)
     _set_if_missing(sender, "last_heartbeat_log_at", 0.0)
-    _set_if_missing(sender, "heartbeat_interval_s", 2.5)
+    _set_if_missing(sender, "heartbeat_interval_s", 5.0)
     _set_if_missing(sender, "startup_stable_snapshot_credit", 0)
     _set_if_missing(sender, "sent_event_stats_cache", {})
     _set_if_missing(sender, "sent_event_stats_ttl_seconds", 600.0)
@@ -141,7 +141,7 @@ def initialize_sender_runtime_state(sender, state_version: int, sender_runtime_g
     sender.last_ack_count = 0
     sender.last_inventory_activity_ts = 0.0
     sender.last_heartbeat_log_at = 0.0
-    sender.heartbeat_interval_s = 2.5
+    sender.heartbeat_interval_s = 5.0
     sender.startup_stable_snapshot_credit = 0
     sender.sent_event_stats_cache = {}
     sender.sent_event_stats_ttl_seconds = 600.0

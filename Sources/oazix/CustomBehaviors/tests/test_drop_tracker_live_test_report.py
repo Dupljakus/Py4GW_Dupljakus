@@ -161,7 +161,7 @@ def test_assess_summary_reports_runtime_log_silence_after_reset():
 
     assert passed is False
     assert any("went silent after reset" in message for message in failures)
-    assert any("session reset" in message for message in warnings)
+    assert not any("session reset" in message for message in warnings)
 
 
 def test_assess_summary_fails_forbidden_rows_and_lifecycle_gaps():

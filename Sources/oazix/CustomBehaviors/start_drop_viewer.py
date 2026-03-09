@@ -756,7 +756,8 @@ class DropViewerWindow:
         self.last_update_sequence = 0
         self.last_update_started_at = 0.0
         self.last_heartbeat_log_at = 0.0
-        self.heartbeat_interval_s = 2.5
+        # Keep liveness telemetry, but reduce debug-log churn during long party runs.
+        self.heartbeat_interval_s = 5.0
         self.chat_requested = False
         self.last_chat_index = -1
         self.chat_bootstrap_floor_index = -1

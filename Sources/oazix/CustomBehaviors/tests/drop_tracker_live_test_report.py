@@ -110,13 +110,22 @@ def assess_summary(summary: dict[str, Any], policy: dict[str, Any] | None = None
     if suppressed_event_count > int(config.get("warn_suppressed_event_count_above", 0) or 0):
         warnings.append(f"{suppressed_event_count} candidate suppression event(s) were observed.")
     if reset_event_count > int(config.get("warn_reset_event_count_above", 0) or 0):
-        if reset_runtime_count > 1:
-            warnings.append(
-                f"{reset_event_count} session reset event(s) occurred across {reset_runtime_count} runtimes "
-                f"(max {max_reset_events_per_runtime} on one runtime)."
-            )
-        else:
-            warnings.append(f"{reset_event_count} session reset event(s) occurred during the run.")
+        # Large multi-client test windows can include many expected reset logs.
+        # Warn only when reset density on one runtime looks suspicious for the
+        # observed rezone count, or when resets happen without rezones.
+        expected_max_per_runtime = max(4, (rezone_count * 2) + 2)
+        suspicious_reset_burst = bool(
+            rezone_count <= 0
+            or max_reset_events_per_runtime > expected_max_per_runtime
+        )
+        if suspicious_reset_burst:
+            if reset_runtime_count > 1:
+                warnings.append(
+                    f"{reset_event_count} session reset event(s) occurred across {reset_runtime_count} runtimes "
+                    f"(max {max_reset_events_per_runtime} on one runtime)."
+                )
+            else:
+                warnings.append(f"{reset_event_count} session reset event(s) occurred during the run.")
     if len(duplicate_drop_rows) > int(config.get("warn_duplicate_drop_rows_above", 0) or 0):
         warnings.append(f"{len(duplicate_drop_rows)} repeated loot-table label(s) were observed.")
     if recovered_send_failed_count > 0:
